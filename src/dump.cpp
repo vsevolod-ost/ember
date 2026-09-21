@@ -1,6 +1,6 @@
 // dump.cpp — hex + ASCII, like the Unix tool `hexdump -C`.
 //
-// The `dump` function below is GIVEN and working, except for one TODO.
+// The `dump` function below is GIVEN and working.
 // Read it before you change it: it is the shape of nearly every loop you will
 // write this semester (an outer loop over rows, an inner loop over columns).
 //
@@ -21,7 +21,6 @@ void dump(const Memory& mem) {
     // std::hex switches the stream to hexadecimal; setfill/setw pad with zeros
     // so every number is the same width and the columns line up.
     for (std::size_t row = 0; row < MEM_SIZE; row += BYTES_PER_LINE) {
-
         // The address column: 0000, 0010, 0020, ...
         std::cout << std::hex << std::setfill('0') << std::setw(4) << row << "  ";
 
@@ -36,11 +35,8 @@ void dump(const Memory& mem) {
         // The ASCII gutter.
         for (std::size_t col = 0; col < BYTES_PER_LINE; ++col) {
             Byte b = mem.data[row + col];
-            // TODO(lab-01, M2): when the byte IS printable, print the byte
-            //                   itself instead of the dot. One token changes.
-            //                   Hint: a Byte sent to std::cout prints as a
-            //                   character already - that is the whole joke of
-            //                   Lab 1. Right now every byte looks unprintable.
+            // A Byte sent to std::cout prints as a character - that is the
+            // whole joke of Lab 1.
             if (is_printable(b)) {
                 std::cout << b;
             } else {

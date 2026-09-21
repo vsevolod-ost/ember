@@ -20,7 +20,7 @@ static bool parse_number(const std::string& word, long& out) {
         std::size_t used = 0;
         // base 0 means: look at the prefix. "0x41" is hex, "65" is decimal.
         out = std::stol(word, &used, 0);
-        return used == word.size();  // reject things like "12abc"
+        return used == word.size(); // reject things like "12abc"
     } catch (...) {
         return false;
     }
@@ -31,13 +31,14 @@ static void print_help() {
               << "  dump              print all " << MEM_SIZE << " bytes\n"
               << "  get <addr>        show one byte four ways\n"
               << "  set <addr> <val>  write one byte (dec or 0x hex)\n"
+              << "  set16 <addr> <v>  write a 16-bit value, little-endian\n"
               << "  inc <addr>        add one to a byte (wraps 255 -> 0)\n"
               << "  help              this list\n"
               << "  quit              leave\n";
 }
 
 int main() {
-    Memory mem;  // 4096 bytes, on the stack, zeroed by the {} in memory.hpp
+    Memory mem; // 4096 bytes, on the stack, zeroed by the {} in memory.hpp
 
     std::cout << "ember 0.1 - 4096 bytes of memory you can see. Type `help`.\n";
 
@@ -58,7 +59,7 @@ int main() {
         words >> cmd;
 
         if (cmd.empty()) {
-            continue;  // the user just pressed Enter
+            continue; // the user just pressed Enter
         } else if (cmd == "quit" || cmd == "exit") {
             break;
         } else if (cmd == "help") {
@@ -86,10 +87,27 @@ int main() {
             } else if (value < 0 || value > 255) {
                 // A cell holds ONE byte. 256 does not fit. Lab 1, theory 3.
                 std::cout << "a byte is 0..255, got " << value << '\n';
-            } else if (!mem_set(mem, static_cast<std::size_t>(addr),
-                                static_cast<Byte>(value))) {
-                std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1
-                          << '\n';
+            } else if (!mem_set(mem, static_cast<std::size_t>(addr), static_cast<Byte>(value))) {
+                std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1 << '\n';
+            }
+        } else if (cmd == "set16") {
+            std::string a, v;
+            long addr = 0, value = 0;
+            if (!(words >> a) || !(words >> v) || !parse_number(a, addr) ||
+                !parse_number(v, value)) {
+                std::cout << "usage: set16 <addr> <value>\n";
+            } else if (addr < 0) {
+                std::cout << "address must not be negative\n";
+            } else if (value < 0 || value > 0xFFFF) {
+                // Two cells hold TWO bytes: 0..65535.
+                std::cout << "a 16-bit value is 0..65535, got " << value << '\n';
+            } else if (static_cast<std::size_t>(addr) + 1 >= MEM_SIZE) {
+                std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1 << '\n';
+            } else {
+                // Little-endian: the low byte goes in first, at the lower address.
+                mem_set(mem, static_cast<std::size_t>(addr), static_cast<Byte>(value & 0xFF));
+                mem_set(mem, static_cast<std::size_t>(addr) + 1,
+                        static_cast<Byte>((value >> 8) & 0xFF));
             }
         } else if (cmd == "inc") {
             std::string a;
@@ -100,13 +118,12 @@ int main() {
                 std::cout << "address must not be negative\n";
             } else {
                 Byte b = mem_get(mem, static_cast<std::size_t>(addr));
-                mem_set(mem, static_cast<std::size_t>(addr),
-                        static_cast<Byte>(b + 1));
+                mem_set(mem, static_cast<std::size_t>(addr), static_cast<Byte>(b + 1));
             }
         } else {
             std::cout << "unknown command: " << cmd << " (try `help`)\n";
         }
     }
 
-    return 0;  // 0 means "success" to the operating system
+    return 0; // 0 means "success" to the operating system
 }
