@@ -52,15 +52,23 @@ void dump(const Memory& mem) {
 }
 
 void show_byte(Byte b) {
-    constexpr const char* sep = "  "; // two spaces
-    int const num = static_cast<int>(b);
+    const char* sep = "  "; // two spaces
+    const int num = static_cast<int>(b);
+
+    // decimal
     std::cout << num << sep;
-    std::cout << "0x" << std::hex << num << sep;
+
+    // hex, always two digits
+    std::cout << "0x" << std::hex << std::setfill('0') << std::setw(2) << num << std::dec
+              << std::setfill(' ') << sep;
+
+    // binary
     std::cout << "0b";
     for (int i = 7; i >= 0; --i) {
         std::cout << ((b >> i) & 1);
     }
     std::cout << sep;
-    std::cout << std::dec;
-    std::cout << '\'' << (is_printable(b) ? (char)b : '.') << '\'' << "\n";
+
+    // ascii
+    std::cout << '\'' << (is_printable(b) ? static_cast<char>(b) : '.') << "'\n";
 }

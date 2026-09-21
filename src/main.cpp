@@ -102,7 +102,9 @@ int main() {
                 // Two cells hold TWO bytes: 0..65535.
                 std::cout << "a 16-bit value is 0..65535, got " << value << '\n';
             } else if (static_cast<std::size_t>(addr) + 1 >= MEM_SIZE) {
-                std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1 << '\n';
+                // Both cells must fit: the last valid start address is MEM_SIZE - 2.
+                std::cout << "set16 needs two bytes at " << addr << " and " << addr + 1
+                          << "; the box is 0.." << MEM_SIZE - 1 << '\n';
             } else {
                 // Little-endian: the low byte goes in first, at the lower address.
                 mem_set(mem, static_cast<std::size_t>(addr), static_cast<Byte>(value & 0xFF));
@@ -117,8 +119,12 @@ int main() {
             } else if (addr < 0) {
                 std::cout << "address must not be negative\n";
             } else {
+                // Read, add one, write back. `b + 1` is computed as int (256 for
+                // b == 255); the cast back to Byte keeps the low 8 bits -> 0.
                 Byte b = mem_get(mem, static_cast<std::size_t>(addr));
-                mem_set(mem, static_cast<std::size_t>(addr), static_cast<Byte>(b + 1));
+                if (!mem_set(mem, static_cast<std::size_t>(addr), static_cast<Byte>(b + 1))) {
+                    std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1 << '\n';
+                }
             }
         } else {
             std::cout << "unknown command: " << cmd << " (try `help`)\n";

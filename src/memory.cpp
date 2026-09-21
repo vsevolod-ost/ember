@@ -7,16 +7,14 @@
 #include "memory.hpp"
 
 Byte mem_get(const Memory& mem, std::size_t addr) {
-    //               otherwise return mem.data[addr].
+    // Out of range: return 0, never touch memory past the end of `data`.
     if (addr >= MEM_SIZE)
         return 0;
     return mem.data[addr];
 }
 
 bool mem_set(Memory& mem, std::size_t addr, Byte value) {
-    //               otherwise write `value` and return true.
-    // Until you do, `set` accepts everything and stores nothing. That is not a
-    // bug in main.cpp - it is this `return true` lying to it.
+    // Out of range: change nothing and tell the caller via `false`.
     if (addr >= MEM_SIZE)
         return false;
     mem.data[addr] = value;
