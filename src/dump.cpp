@@ -42,7 +42,7 @@ void dump(const Memory& mem) {
             //                   character already - that is the whole joke of
             //                   Lab 1. Right now every byte looks unprintable.
             if (is_printable(b)) {
-                std::cout << '.';
+                std::cout << b;
             } else {
                 std::cout << '.';
             }
@@ -56,22 +56,15 @@ void dump(const Memory& mem) {
 }
 
 void show_byte(Byte b) {
-    // TODO(lab-01, M3): print these four things on one line, separated by
-    // two spaces, then a newline:
-    //
-    //   1. b as a decimal number          -> 65
-    //      Careful: `std::cout << b` prints a CHARACTER, because Byte is a
-    //      one-byte type. Use static_cast<int>(b) to print the number.
-    //   2. b as hex, with a 0x prefix     -> 0x41
-    //      std::hex switches the stream; std::dec switches it back.
-    //   3. b as 8 binary digits, 0b first -> 0b01000001
-    //      There is no std::bin. Loop from bit 7 down to bit 0 and print
-    //      ((b >> i) & 1). That expression is Lab 2 arriving early.
-    //   4. b as a character in quotes     -> 'A'
-    //      Use is_printable(b); print '.' for bytes a terminal cannot show.
-    //
-    // Expected for `set 0 65` then `get 0`:
-    //   65  0x41  0b01000001  'A'
-    std::cout << "show_byte: not implemented yet (byte was "
-              << static_cast<int>(b) << ")\n";
+    constexpr const char* sep = "  "; // two spaces
+    int const num = static_cast<int>(b);
+    std::cout << num << sep;
+    std::cout << "0x" << std::hex << num << sep;
+    std::cout << "0b";
+    for (int i = 7; i >= 0; --i) {
+        std::cout << ((b >> i) & 1);
+    }
+    std::cout << sep;
+    std::cout << std::dec;
+    std::cout << '\'' << (is_printable(b) ? (char)b : '.') << '\'' << "\n";
 }
