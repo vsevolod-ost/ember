@@ -56,7 +56,38 @@ Until you implement `mem_set`, `set` accepts everything and stores nothing, and
 `get` prints `show_byte: not implemented yet`. That is the starting state, not a
 bug.
 
-## M1 — `sizeof` на цій машині (64-bit Linux)
+## M1 — збірка та вітання
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+./build/ember
+```
+
+```txt
+ember 0.1 - 4096 bytes of memory you can see. Type `help`.
+ember>
+```
+
+Збирається на C++17 з `-Wall -Wextra -Werror`, ASan+UBSan увімкнені на
+Debug (`CMakeLists.txt`). Однорядкове вітання і prompt — вище, зняті з
+чистого запуску.
+
+## M2 — порожня коробка (доказ)
+
+Перші три рядки `dump` одразу після старту, без жодного `set`:
+
+```txt
+ember> dump
+0000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+0010  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+0020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+```
+
+Суцільні нулі — це `{}` у `Byte data[MEM_SIZE]{}` (`memory.hpp`), яке
+занулює всю коробку при створенні `Memory`.
+
+## `sizeof` на цій машині (64-bit Linux, notes §1)
 
 ```cpp
 #include <iostream>
