@@ -31,6 +31,7 @@ static void print_help() {
               << "  dump              print all " << MEM_SIZE << " bytes\n"
               << "  get <addr>        show one byte four ways\n"
               << "  set <addr> <val>  write one byte (dec or 0x hex)\n"
+              << "  inc <addr>        add one to a byte (wraps 255 -> 0)\n"
               << "  help              this list\n"
               << "  quit              leave\n";
 }
@@ -89,6 +90,18 @@ int main() {
                                 static_cast<Byte>(value))) {
                 std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1
                           << '\n';
+            }
+        } else if (cmd == "inc") {
+            std::string a;
+            long addr = 0;
+            if (!(words >> a) || !parse_number(a, addr)) {
+                std::cout << "usage: inc <addr>\n";
+            } else if (addr < 0) {
+                std::cout << "address must not be negative\n";
+            } else {
+                Byte b = mem_get(mem, static_cast<std::size_t>(addr));
+                mem_set(mem, static_cast<std::size_t>(addr),
+                        static_cast<Byte>(b + 1));
             }
         } else {
             std::cout << "unknown command: " << cmd << " (try `help`)\n";
