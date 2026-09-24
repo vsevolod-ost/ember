@@ -184,15 +184,18 @@ int main() {
             words >> name >> x;
             const bool one =
                 name == "not" || name == "shl" || name == "shr" || name == "inc" || name == "dec";
+            const bool two =
+                name == "add" || name == "sub" || name == "and" || name == "or" || name == "xor";
             Byte r = 0;
             Flags f{};
-            if (!parse_number(x, a) || (!one && (!(words >> y) || !parse_number(y, b)))) {
+            if (!name.empty() && !one && !two) {
+                std::cout << "unknown alu op: " << name << '\n';
+            } else if (!parse_number(x, a) || (!one && (!(words >> y) || !parse_number(y, b)))) {
                 std::cout << "usage: alu <op> <a> [b]\n";
             } else if (a < 0 || a > 255 || b < 0 || b > 255) {
                 std::cout << "a byte is 0..255\n";
-            } else if (!alu_by_name(name, static_cast<Byte>(a), static_cast<Byte>(b), r, f)) {
-                std::cout << "unknown alu op: " << name << '\n';
             } else {
+                alu_by_name(name, static_cast<Byte>(a), static_cast<Byte>(b), r, f);
                 std::cout << "result=" << static_cast<int>(r) << "  Z=" << f.z << " N=" << f.n
                           << " C=" << f.c << '\n';
             }
