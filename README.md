@@ -255,3 +255,135 @@ main:
 
 - `mov DWORD PTR [rbp-4], 67` кладе літерал `67` у `x` на стеку;
 - `mov eax, DWORD PTR [rbp-4]` читає ці самі чотири байти назад у регістр `eax` для `return x`.
+
+---
+
+# Lab 02 — Біти не брешуть
+
+## M1 — ALU: два розібрані приклади
+
+```txt
+ember> alu add 200 100
+result=44  Z=0 N=0 C=1
+```
+
+```txt
+    11001000   200
+  + 01100100   100
+  ----------
+  1 00101100   300 = 256 + 44  -> A = 44, дев'ятий біт іде в C
+```
+
+```txt
+ember> alu shl 200
+result=144  Z=0 N=1 C=1
+```
+
+```txt
+  11001000   200
+  10010000   144   старший біт виїхав у C = 1; новий біт 7 = 1 -> N = 1
+```
+
+## M2 — `set` → `step` → `regs`
+
+`LOADI A, 200`, `LOADI B, 100`, `ADD A, B`, `HALT`:
+
+```txt
+ember> set 0 0x20
+ember> set 1 200
+ember> set 2 0x21
+ember> set 3 100
+ember> set 4 0x10
+ember> set 5 0x00
+ember> regs
+PC=0x0000  A=0  B=0  Z=0 N=0 C=0
+ember> step
+0000  20 c8  LOADI A  -> A=200  Z=0 N=0 C=0
+ember> step
+0002  21 64  LOADI B  -> A=200  Z=0 N=0 C=0
+ember> step
+0004  10     ADD A, B -> A= 44  Z=0 N=0 C=1
+ember> regs
+PC=0x0005  A=44  B=100  Z=0 N=0 C=1
+ember> step
+0005  00     HALT     -> A= 44  Z=0 N=0 C=1
+ember> regs
+PC=0x0006  A=44  B=100  Z=0 N=0 C=1
+ember> step
+halted: step does nothing after HALT
+```
+
+## M3 — трейси
+
+Рядок трейсу: `PC`, байти інструкції, мнемоніка, нове `A`, прапорці.
+
+`A=7`, `B=1`, `AND A, B`, `HALT`:
+
+```txt
+ember> set 0 0x20
+ember> set 1 7
+ember> set 2 0x21
+ember> set 3 1
+ember> set 4 0x12
+ember> set 5 0x00
+ember> step
+0000  20 07  LOADI A  -> A=  7  Z=0 N=0 C=0
+ember> step
+0002  21 01  LOADI B  -> A=  7  Z=0 N=0 C=0
+ember> step
+0004  12     AND A, B -> A=  1  Z=0 N=0 C=0
+ember> step
+0005  00     HALT     -> A=  1  Z=0 N=0 C=0
+ember> regs
+PC=0x0006  A=1  B=1  Z=0 N=0 C=0
+```
+
+`SHL`, поки не з'явиться перенесення:
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x41
+ember> set 2 0x16
+ember> set 3 0x16
+ember> set 4 0x00
+ember> run
+0000  20 41  LOADI A  -> A= 65  Z=0 N=0 C=0
+0002  16     SHL A    -> A=130  Z=0 N=1 C=0
+0003  16     SHL A    -> A=  4  Z=0 N=0 C=1
+0004  00     HALT     -> A=  4  Z=0 N=0 C=1
+ember> regs
+PC=0x0005  A=4  B=0  Z=0 N=0 C=1
+ember> get 0xB00
+1  0x01  0b00000001  '.'
+```
+
+## Реалізовані рядки [ISA.uk.md](https://github.com/rmalkevy/Programming-Practice-Projects/blob/main/courses/programming-fundamentals/ISA.uk.md)
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x00` | `HALT` | 1 | — | зупинитись; наступні `step` відмовляють | 2 |
+| `0x01` | `NOP` | 1 | — | нічого | 2 |
+| `0x10` | `ADD A, B` | 1 | Z N C | `A = A + B` | 2 |
+| `0x11` | `SUB A, B` | 1 | Z N C | `A = A - B` | 2 |
+| `0x12` | `AND A, B` | 1 | Z N, C=0 | `A = A & B` | 2 |
+| `0x13` | `OR A, B` | 1 | Z N, C=0 | `A = A \| B` | 2 |
+| `0x14` | `XOR A, B` | 1 | Z N, C=0 | `A = A ^ B` | 2 |
+| `0x15` | `NOT A` | 1 | Z N, C=0 | `A = ~A` | 2 |
+| `0x16` | `SHL A` | 1 | Z N C | `A = A << 1`; у `C` потрапляє біт, що виїхав із сьомої позиції | 2 |
+| `0x17` | `SHR A` | 1 | Z N C | `A = A >> 1`; у `C` потрапляє біт, що виїхав із нульової | 2 |
+| `0x18` | `INC A` | 1 | Z N | `A = A + 1` | 2 |
+| `0x19` | `DEC A` | 1 | Z N | `A = A - 1` | 2 |
+| `0x20` | `LOADI A, imm8` | 2 | — | `A = imm8` | 3 |
+| `0x21` | `LOADI B, imm8` | 2 | — | `B = imm8` | 3 |
+
+`LOADI A/B` із Лаби 3 — бо їх використовує `checks/lab-02.txt`.
+
+## Власні розширення
+
+| Регіон | Діапазон | Константа | З'являється в |
+|---|---|---|---|
+| Байт стану | `0xB00` | `STATUS_ADDR` | Лаба 2 |
+
+Після кожного `step` дзеркалить прапорці: `0b00000ZNC` (біт 2 — `Z`, біт 1 — `N`, біт 0 — `C`).
+
+`ADD` зібраний із бітів (`src/alu.cpp`, цикл із notes §5); `uint8_t(a + b)` і перенесення перевіряються `assert` у Debug.

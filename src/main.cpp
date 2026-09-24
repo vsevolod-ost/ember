@@ -10,6 +10,8 @@
 #include <sstream>
 #include <string>
 
+#include "alu.hpp"
+#include "cpu.hpp"
 #include "dump.hpp"
 #include "memory.hpp"
 
@@ -26,6 +28,51 @@ static bool parse_number(const std::string& word, long& out) {
     }
 }
 
+// Run one ALU op by name on fresh (all-zero) flags. False if the name is unknown.
+static bool alu_by_name(const std::string& name, Byte a, Byte b, Byte& r, Flags& f) {
+    if (name == "add")
+        r = alu_add(a, b, f);
+    else if (name == "sub")
+        r = alu_sub(a, b, f);
+    else if (name == "and")
+        r = alu_and(a, b, f);
+    else if (name == "or")
+        r = alu_or(a, b, f);
+    else if (name == "xor")
+        r = alu_xor(a, b, f);
+    else if (name == "not")
+        r = alu_not(a, f);
+    else if (name == "shl")
+        r = alu_shl(a, f);
+    else if (name == "shr")
+        r = alu_shr(a, f);
+    else if (name == "inc")
+        r = alu_inc(a, f);
+    else if (name == "dec")
+        r = alu_dec(a, f);
+    else
+        return false;
+    return true;
+}
+
+static void report(StepResult r, const CPU& cpu) {
+    switch (r) {
+    case StepResult::ok:
+        break;
+    case StepResult::halted:
+        std::cout << "halted: step does nothing after HALT\n";
+        break;
+    case StepResult::bad_opcode:
+        std::cout << "unknown opcode 0x" << std::hex << static_cast<int>(mem_get(*cpu.mem, cpu.pc))
+                  << " at 0x" << cpu.pc << std::dec << "; nothing done\n";
+        break;
+    case StepResult::out_of_memory:
+        std::cout << "instruction at 0x" << std::hex << cpu.pc << std::dec << " does not fit in 0.."
+                  << MEM_SIZE - 1 << "; nothing done\n";
+        break;
+    }
+}
+
 static void print_help() {
     std::cout << "commands:\n"
               << "  dump              print all " << MEM_SIZE << " bytes\n"
@@ -33,12 +80,17 @@ static void print_help() {
               << "  set <addr> <val>  write one byte (dec or 0x hex)\n"
               << "  set16 <addr> <v>  write a 16-bit value, little-endian\n"
               << "  inc <addr>        add one to a byte (wraps 255 -> 0)\n"
+              << "  alu <op> <a> [b]  add sub and or xor (a b); not shl shr inc dec (a)\n"
+              << "  regs              print PC A B Z N C\n"
+              << "  step              execute one instruction at PC\n"
+              << "  run               step until HALT or an error\n"
               << "  help              this list\n"
               << "  quit              leave\n";
 }
 
 int main() {
     Memory mem; // 4096 bytes, on the stack, zeroed by the {} in memory.hpp
+    CPU cpu{&mem};
 
     std::cout << "ember 0.1 - 4096 bytes of memory you can see. Type `help`.\n";
 
@@ -126,6 +178,33 @@ int main() {
                     std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1 << '\n';
                 }
             }
+        } else if (cmd == "alu") {
+            std::string name, x, y;
+            long a = 0, b = 0;
+            words >> name >> x;
+            const bool one =
+                name == "not" || name == "shl" || name == "shr" || name == "inc" || name == "dec";
+            Byte r = 0;
+            Flags f{};
+            if (!parse_number(x, a) || (!one && (!(words >> y) || !parse_number(y, b)))) {
+                std::cout << "usage: alu <op> <a> [b]\n";
+            } else if (a < 0 || a > 255 || b < 0 || b > 255) {
+                std::cout << "a byte is 0..255\n";
+            } else if (!alu_by_name(name, static_cast<Byte>(a), static_cast<Byte>(b), r, f)) {
+                std::cout << "unknown alu op: " << name << '\n';
+            } else {
+                std::cout << "result=" << static_cast<int>(r) << "  Z=" << f.z << " N=" << f.n
+                          << " C=" << f.c << '\n';
+            }
+        } else if (cmd == "regs") {
+            dump_regs(cpu);
+        } else if (cmd == "step") {
+            report(step(cpu), cpu);
+        } else if (cmd == "run") {
+            StepResult r = step(cpu);
+            while (r == StepResult::ok && !cpu.halted)
+                r = step(cpu);
+            report(r, cpu);
         } else {
             std::cout << "unknown command: " << cmd << " (try `help`)\n";
         }
