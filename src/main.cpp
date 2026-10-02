@@ -79,6 +79,7 @@ static void print_help() {
               << "  get <addr>        show one byte four ways\n"
               << "  set <addr> <val>  write one byte (dec or 0x hex)\n"
               << "  set16 <addr> <v>  write a 16-bit value, little-endian\n"
+              << "  reg <a|b> <v>     put 0..255 into register A or B\n"
               << "  inc <addr>        add one to a byte (wraps 255 -> 0)\n"
               << "  alu <op> <a> [b]  add sub and or xor (a b); not shl shr inc dec (a)\n"
               << "  regs              print PC A B Z N C\n"
@@ -162,6 +163,19 @@ int main() {
                 mem_set(mem, static_cast<std::size_t>(addr), static_cast<Byte>(value & 0xFF));
                 mem_set(mem, static_cast<std::size_t>(addr) + 1,
                         static_cast<Byte>((value >> 8) & 0xFF));
+            }
+        } else if (cmd == "reg") {
+            std::string r, v;
+            long value = 0;
+            if (!(words >> r) || !(words >> v) || !parse_number(v, value) || value < 0 ||
+                value > 255) {
+                std::cout << "usage: reg <a|b> <0..255>\n";
+            } else if (r == "a") {
+                cpu.a = (Byte)value;
+            } else if (r == "b") {
+                cpu.b = (Byte)value;
+            } else {
+                std::cout << "unknown register: " << r << '\n';
             }
         } else if (cmd == "inc") {
             std::string a;
