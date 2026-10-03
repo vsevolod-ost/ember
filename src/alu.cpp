@@ -19,7 +19,7 @@ Byte alu_add(Byte a, Byte b, Flags& f) {
         const bool bb = (b >> i) & 1;
         if (ab ^ bb ^ carry)
             sum = static_cast<Byte>(sum | (1u << i));
-        carry = (ab && bb) || (ab && carry) || (bb && carry);
+        carry = (ab & bb) | (ab & carry) | (bb & carry);
     }
     assert(sum == static_cast<Byte>(a + b));
     assert(carry == (a + b > 0xFF));
