@@ -17,6 +17,8 @@
 #include "guest_io.hpp"
 #include "hexdump.hpp"
 #include "memory.hpp"
+#include "run.hpp"
+#include "search.hpp"
 
 // Turn a word into a number. Accepts decimal (65) and hex (0x41).
 // Returns false if the word is not a number at all.
@@ -111,8 +113,12 @@ static void print_help() {
               << "  alu <op> <a> [b]  add sub and or xor (a b); not shl shr inc dec (a)\n"
               << "  regs              print PC A B H Z N C\n"
               << "  step              execute one instruction at PC, print its trace\n"
-              << "  run               step until HALT or an error, print the step count\n"
+              << "  run               step until HALT, an error, the breakpoint or "
+              << RUN_STEP_LIMIT << " steps\n"
               << "  trace <on|off>    also print a trace line per step in run (off)\n"
+              << "  b <addr> | b off  stop run before the instruction at addr; b alone = off\n"
+              << "  find <lo> <hi> <byte>\n"
+              << "                    first address in [lo, hi) that holds byte\n"
               << "  hostdump cpu      the host's CPU struct as raw bytes\n"
               << "  help              this list\n"
               << "  quit              leave\n";
@@ -121,7 +127,8 @@ static void print_help() {
 int main() {
     Memory mem; // 4096 bytes, on the stack, zeroed by the {} in memory.hpp
     CPU cpu{&mem};
-    bool trace = false; // `trace on`: run prints a line per step, like step
+    bool trace = false;   // `trace on`: run prints a line per step, like step
+    long breakpoint = -1; // `b <addr>`: run stops when PC gets there; -1 = none
 
     std::cout << "ember 0.1 - 4096 bytes of memory you can see. Type `help`.\n";
 
@@ -295,23 +302,22 @@ int main() {
             report(step(cpu, true), cpu);
         } else if (cmd == "run") {
             // Quiet unless `trace on`: the guest's output, then how many
-            // instructions ran (HALT included).
-            unsigned long steps = 0;
-            StepResult r = step(cpu, trace);
-            while (r == StepResult::ok) {
-                ++steps;
-                if (cpu.halted)
-                    break;
-                r = step(cpu, trace);
-            }
+            // instructions ran (HALT included). The loop is in run.cpp.
+            const RunResult r = run(cpu, trace, breakpoint);
             guest_end_line();
-            if (r == StepResult::ok) {
-                std::cout << "halted after " << steps << " steps\n";
+            if (r.why == RunStop::halted) {
+                std::cout << "halted after " << r.steps << " steps\n";
+            } else if (r.why == RunStop::error) {
+                report(r.error, cpu);
+            } else if (r.why == RunStop::breakpoint) {
+                std::cout << "breakpoint at " << hex(cpu.pc, 4) << '\n';
             } else {
-                report(r, cpu);
-                if (r != StepResult::halted) // already halted: the refusal says it all
-                    std::cout << "stopped after " << steps << " steps\n";
+                std::cout << "step limit " << RUN_STEP_LIMIT << " reached at " << hex(cpu.pc, 4)
+                          << '\n';
             }
+            // Already halted before this run: the refusal says it all.
+            if (r.why != RunStop::halted && r.error != StepResult::halted)
+                std::cout << "stopped after " << r.steps << " steps\n";
         } else if (cmd == "trace") {
             std::string v;
             words >> v;
@@ -321,6 +327,49 @@ int main() {
                 trace = false;
             else
                 std::cout << "usage: trace <on|off>\n";
+        } else if (cmd == "b") {
+            // One breakpoint; `b` and `b off` clear it. `step` ignores it.
+            std::string a, extra;
+            long addr = 0;
+            words >> a;
+            if (words >> extra) {
+                std::cout << "usage: b <addr> | b off\n";
+            } else if (a.empty() || a == "off") {
+                breakpoint = -1;
+                std::cout << "no breakpoint\n";
+            } else if (!parse_number(a, addr)) {
+                std::cout << "usage: b <addr> | b off\n";
+            } else if (addr < 0) {
+                std::cout << "address must not be negative\n";
+            } else if (static_cast<std::size_t>(addr) >= MEM_SIZE) {
+                std::cout << "address " << addr << " is outside 0.." << MEM_SIZE - 1 << '\n';
+            } else {
+                breakpoint = addr;
+                std::cout << "breakpoint at " << hex(static_cast<unsigned>(addr), 4) << '\n';
+            }
+        } else if (cmd == "find") {
+            // The given C++ loop (search.cpp) over [lo, hi): hi itself is not
+            // looked at, and hi == MEM_SIZE means "to the end of the box".
+            std::string l, h, n, extra;
+            long lo = 0, hi = 0, needle = 0;
+            if (!(words >> l >> h >> n) || words >> extra || !parse_number(l, lo) ||
+                !parse_number(h, hi) || !parse_number(n, needle)) {
+                std::cout << "usage: find <lo> <hi> <byte>\n";
+            } else if (lo < 0 || lo > hi || static_cast<std::size_t>(hi) > MEM_SIZE) {
+                std::cout << "range must be 0 <= lo <= hi <= " << MEM_SIZE << '\n';
+            } else if (needle < 0 || needle > 255) {
+                std::cout << "a byte is 0..255, got " << needle << '\n';
+            } else {
+                const auto from = static_cast<std::uint16_t>(lo),
+                           to = static_cast<std::uint16_t>(hi);
+                const std::uint16_t i = find(mem, from, to, static_cast<Byte>(needle));
+                if (i == to)
+                    std::cout << hex(static_cast<unsigned>(needle), 2) << " not found in ["
+                              << hex(from, 4) << ", " << hex(to, 4) << ")\n";
+                else
+                    std::cout << "found " << hex(static_cast<unsigned>(needle), 2) << " at "
+                              << hex(i, 4) << '\n';
+            }
         } else if (cmd == "hostdump") {
             std::string what;
             words >> what;

@@ -1029,3 +1029,719 @@ ember> quit
 | Дані | `0x800`–`0x9FF` | `DATA_LO`, `DATA_HI` | Lab 3 |
 
 Власних розширень у Лабі 3 немає; байт стану `0xB00` — як у Lab 02.
+
+---
+
+# Lab 04 — Форма керування
+
+Нові й змінені команди REPL:
+
+| Команда | Що робить |
+|---|---|
+| `run` | як у Lab 03, плюс дві нові зупинки: ліміт кроків (`step limit 100000 reached at …`) і точка зупину (`breakpoint at …`); після обох — `stopped after N steps`, машина не `halted`, наступний `run` іде далі |
+| `b <addr>` / `b off` | точка зупину: `run` зупиняється перед інструкцією за адресою `addr` (0..4095); `b` або `b off` — зняти |
+| `find <lo> <hi> <byte>` | перша адреса в `[lo, hi)`, де лежить `byte` (`0 <= lo <= hi <= 4096`), — даний цикл C++ |
+
+Рядок трасування той самий, що в Lab 03: перша колонка — `PC` у момент вибірки (адреса інструкції), далі її байти, мнемоніка й `A B H Z N C` **після** виконання. Після стрибка, що спрацював, наступний рядок починається з адреси цілі.
+
+## M1 — повний `switch`, невідомий опкод — помилка
+
+`step()` (`src/cpu.cpp`) — два `switch`: зовнішній за групою (старший напівбайт, ISA §4), внутрішній за `Op`. Кожен відомий опкод має власний `case`, а `default` на обох рівнях повертає `StepResult::bad_opcode`. Першим невідомий опкод ловить `instr_size()` (`default: return 0;` — рядка в таблиці ISA немає), ще до перевірки `at + size > MEM_SIZE`; `default:` декодера — друга лінія з тією самою помилкою. «Зупиняє машину» означає: `step` відмовляє, `run` зупиняється, нічого не змінено (`PC`, регістри, прапорці, пам'ять); `halted` не ставиться, тож після виправлення байта машина працює далі.
+
+`0xFF` — сміття, `0x1B` — рядок ISA Лаби 7 (`MUL`), ще не реалізований, `0x35` — у групі стрибків, але рядка немає:
+
+```txt
+ember> set 0 0xFF
+ember> run
+unknown opcode 0xff at 0x0000; nothing done
+stopped after 0 steps
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> set 0 0x1B
+ember> step
+unknown opcode 0x1b at 0x0000; nothing done
+ember> set 0 0x35
+ember> step
+unknown opcode 0x35 at 0x0000; nothing done
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> set 0 0x00
+ember> run
+halted after 1 steps
+ember> quit
+```
+
+## M2 — `CMP`, `JMP`, `JZ`, `JNZ`
+
+`CMP` — це `alu_sub(cpu.a, cpu.b, cpu.f)` без запису в `A`. `step` спершу рахує, де наступна інструкція; стрибок, що спрацював, **замінює** це значення на `addr16`, а не додає до нього:
+
+```cpp
+    std::uint16_t next = static_cast<std::uint16_t>(at + size);
+    ...
+        case Op::Jz:
+            if (cpu.f.z && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+    ...
+    cpu.pc = next;
+```
+
+```txt
+адр.  байти       текст
+0000  1A          CMP A, B
+0001  31 10 00    JZ 0x0010
+```
+
+`A = B = 5`: `Z = 1`, стрибок спрацював — `PC = 0x0010`, а не `0x0013`:
+
+```txt
+ember> reg a 5
+ember> reg b 5
+ember> set 0 0x1A
+ember> set 1 0x31
+ember> set16 2 0x0010
+ember> step
+0000  1a        CMP A, B          -> A=  5  B=  5  H=0x0000  Z=1 N=0 C=0
+ember> regs
+PC=0x0001  A=5  B=5  H=0x0000  Z=1 N=0 C=0
+ember> step
+0001  31 10 00  JZ 0x0010         -> A=  5  B=  5  H=0x0000  Z=1 N=0 C=0
+ember> regs
+PC=0x0010  A=5  B=5  H=0x0000  Z=1 N=0 C=0
+ember> quit
+```
+
+`A = 3`, `B = 5`: `3 - 5 = 254` з позикою (`Z=0 N=1 C=1`), стрибок не спрацював — `PC = 0x0004`:
+
+```txt
+ember> reg a 3
+ember> reg b 5
+ember> set 0 0x1A
+ember> set 1 0x31
+ember> set16 2 0x0010
+ember> step
+0000  1a        CMP A, B          -> A=  3  B=  5  H=0x0000  Z=0 N=1 C=1
+ember> regs
+PC=0x0001  A=3  B=5  H=0x0000  Z=0 N=1 C=1
+ember> step
+0001  31 10 00  JZ 0x0010         -> A=  3  B=  5  H=0x0000  Z=0 N=1 C=1
+ember> regs
+PC=0x0004  A=3  B=5  H=0x0000  Z=0 N=1 C=1
+ember> quit
+```
+
+Операнд стрибка лежить молодшим байтом уперед і читається даним `get16`: `30 23 01` — це `JMP 0x0123`. Стрибок, що спрацював, на адресу `>= 4096` відхиляється на самому стрибку: повідомлення, нічого не змінено, `PC` лишається на `JMP`. Стрибок, що не спрацював, ціль не використовує — `PC += 3` (той самий принцип, що з `H` у Lab 03: тримати погану адресу можна, користуватись — ні). Прапорців стрибки не чіпають:
+
+```txt
+ember> set 0 0x30
+ember> set16 1 0x0123
+ember> dump 0 16
+0000  30 23 01 00 00 00 00 00 00 00 00 00 00 00 00 00  |0#..............|
+ember> step
+0000  30 23 01  JMP 0x0123        -> A=  0  B=  0  H=0x0000  Z=0 N=0 C=0
+ember> regs
+PC=0x0123  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> reg pc 0
+ember> set16 1 0x1000
+ember> step
+address 0x1000 is outside 0..4095 (JMP 0x1000 at 0x0000); nothing done
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> set 0 0x31
+ember> step
+0000  31 00 10  JZ 0x1000         -> A=  0  B=  0  H=0x0000  Z=0 N=0 C=0
+ember> regs
+PC=0x0003  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> quit
+```
+
+### Ліміт кроків у `run`
+
+`src/run.hpp`:
+
+```cpp
+// A program that never reaches HALT (JMP to itself) must not hang the REPL.
+// Counted per `run` command; the next `run` gets the same budget again.
+const unsigned long RUN_STEP_LIMIT = 100000;
+```
+
+`src/run.cpp`:
+
+```cpp
+RunResult run(CPU& cpu, bool trace, long breakpoint) {
+    unsigned long steps = 0;
+    while (true) {
+        if (steps > 0 && cpu.pc == breakpoint)
+            return {RunStop::breakpoint, StepResult::ok, steps};
+        if (steps == RUN_STEP_LIMIT)
+            return {RunStop::step_limit, StepResult::ok, steps};
+        const StepResult r = step(cpu, trace);
+        if (r != StepResult::ok)
+            return {RunStop::error, r, steps};
+        ++steps;
+        if (cpu.halted)
+            return {RunStop::halted, StepResult::ok, steps};
+    }
+}
+```
+
+Ліміт — `RUN_STEP_LIMIT = 100000` кроків на **один** виклик `run`. Якщо за 100000 кроків не виконався `HALT`, `run` друкує `step limit 100000 reached at 0x....` (адреса наступної, ще не виконаної інструкції) і `stopped after 100000 steps`. Машина не `halted`: `step` і наступний `run` продовжують з того самого `PC`. Якщо `HALT` — рівно 100000-й крок, це звичайне `halted after 100000 steps`. `JMP` сам на себе (`30 00 00`):
+
+```txt
+ember> set 0 0x30
+ember> run
+step limit 100000 reached at 0x0000
+stopped after 100000 steps
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> step
+0000  30 00 00  JMP 0x0000        -> A=  0  B=  0  H=0x0000  Z=0 N=0 C=0
+ember> quit
+```
+
+## M3 — цикл у байткоді
+
+Зворотний відлік з [ISA.uk.md §9](https://github.com/rmalkevy/Programming-Practice-Projects/blob/main/courses/programming-fundamentals/ISA.uk.md#9-дві-програми-щоб-перевірити-себе):
+
+```txt
+адр.  байти       текст
+0000  20 03       LOADI A, 3
+0002  03          loop:  OUTN
+0003  19                 DEC A
+0004  32 02 00           JNZ loop
+0007  00                 HALT
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x03
+ember> set 2 0x03
+ember> set 3 0x19
+ember> set 4 0x32
+ember> set 5 0x02
+ember> set 6 0x00
+ember> set 7 0x00
+ember> trace on
+ember> run
+0000  20 03     LOADI A, 0x03     -> A=  3  B=  0  H=0x0000  Z=0 N=0 C=0
+3 
+0002  03        OUTN              -> A=  3  B=  0  H=0x0000  Z=0 N=0 C=0
+0003  19        DEC A             -> A=  2  B=  0  H=0x0000  Z=0 N=0 C=0
+0004  32 02 00  JNZ 0x0002        -> A=  2  B=  0  H=0x0000  Z=0 N=0 C=0
+2 
+0002  03        OUTN              -> A=  2  B=  0  H=0x0000  Z=0 N=0 C=0
+0003  19        DEC A             -> A=  1  B=  0  H=0x0000  Z=0 N=0 C=0
+0004  32 02 00  JNZ 0x0002        -> A=  1  B=  0  H=0x0000  Z=0 N=0 C=0
+1 
+0002  03        OUTN              -> A=  1  B=  0  H=0x0000  Z=0 N=0 C=0
+0003  19        DEC A             -> A=  0  B=  0  H=0x0000  Z=1 N=0 C=0
+0004  32 02 00  JNZ 0x0002        -> A=  0  B=  0  H=0x0000  Z=1 N=0 C=0
+0007  00        HALT              -> A=  0  B=  0  H=0x0000  Z=1 N=0 C=0
+halted after 11 steps
+ember> regs
+PC=0x0008  A=0  B=0  H=0x0000  Z=1 N=0 C=0
+ember> quit
+```
+
+11 рядків — по одному на крок (`3n + 2` для `n = 3`). Після `0004 … JNZ 0x0002` при `Z=0` наступний рядок — `0002`; на останньому `JNZ` `Z=1`, і `PC` іде далі на `0007`.
+
+Те саме на C++ (тимчасовий `scratch.cpp` у корені проєкту, він у `.gitignore`; після прогону видалений):
+
+```cpp
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+
+int main(int argc, char* argv[]) {
+    const std::uint8_t n = static_cast<std::uint8_t>(argc > 1 ? std::atoi(argv[1]) : 3);
+
+    std::uint8_t a = n;
+    while (a != 0) { // перевірка ДО тіла: 0 разів, якщо a == 0
+        std::cout << +a << ' ';
+        a = a - 1;
+    }
+    std::cout << "| while\n";
+
+    a = n;
+    do { // перевірка ПІСЛЯ тіла, як JNZ унизу: щонайменше раз
+        std::cout << +a << ' ';
+        a = a - 1;
+    } while (a != 0);
+    std::cout << "| do-while\n";
+}
+```
+
+```bash
+c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined scratch.cpp -o scratch && ./scratch 3 && ./scratch 0
+```
+
+```txt
+3 2 1 | while
+3 2 1 | do-while
+| while
+0 255 254 253 252 251 250 249 248 247 246 245 244 243 242 241 240 239 238 237 236 235 234 233 232 231 230 229 228 227 226 225 224 223 222 221 220 219 218 217 216 215 214 213 212 211 210 209 208 207 206 205 204 203 202 201 200 199 198 197 196 195 194 193 192 191 190 189 188 187 186 185 184 183 182 181 180 179 178 177 176 175 174 173 172 171 170 169 168 167 166 165 164 163 162 161 160 159 158 157 156 155 154 153 152 151 150 149 148 147 146 145 144 143 142 141 140 139 138 137 136 135 134 133 132 131 130 129 128 127 126 125 124 123 122 121 120 119 118 117 116 115 114 113 112 111 110 109 108 107 106 105 104 103 102 101 100 99 98 97 96 95 94 93 92 91 90 89 88 87 86 85 84 83 82 81 80 79 78 77 76 75 74 73 72 71 70 69 68 67 66 65 64 63 62 61 60 59 58 57 56 55 54 53 52 51 50 49 48 47 46 45 44 43 42 41 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 | do-while
+```
+
+Одна форма, два записи: `OUTN` — `std::cout << +a`, `DEC A` — `a = a - 1` і водночас умова (`Z` = `a == 0`), `JNZ loop` — `a != 0` і стрибок назад. `JNZ` стоїть **після** тіла, тому програма з ISA §9 — це `do-while`: для `a = 3` обидва цикли друкують `3 2 1`, а для `a = 0` `while` не друкує нічого, тоді як `do-while` — 256 чисел, як і `ember` з `20 00` (770 кроків). `while` з перевіркою **до** тіла в байткоді — `CMP`/`JZ` на вихід угорі циклу й `JMP` назад унизу.
+
+## M4 — лінійний пошук, двічі
+
+### `find` на C++
+
+Даний цикл з теорії §3, `src/search.cpp` (`clang-format` переніс `return i;` на окремий рядок, більше нічого не змінено):
+
+```cpp
+// знайти перше i в [lo, hi), де mem_get(mem, i) == needle; якщо промах — повернути hi
+std::uint16_t find(const Memory& mem, std::uint16_t lo, std::uint16_t hi, Byte needle) {
+    for (std::uint16_t i = lo; i < hi; ++i) {
+        if (mem_get(mem, i) == needle)
+            return i;
+    }
+    return hi;
+}
+```
+
+`hi` не входить у ділянку; `lo == hi` — порожня ділянка, тобто промах; `hi = 4096` — до кінця коробки:
+
+```txt
+ember> set 0x803 0x41
+ember> set 0x805 0x41
+ember> find 0x800 0x808 0x41
+found 0x41 at 0x0803
+ember> find 0x800 0x803 0x41
+0x41 not found in [0x0800, 0x0803)
+ember> set 0x808 0x41
+ember> find 0x804 0x808 0x41
+found 0x41 at 0x0805
+ember> find 0x806 0x808 0x41
+0x41 not found in [0x0806, 0x0808)
+ember> find 0x806 0x809 0x41
+found 0x41 at 0x0808
+ember> find 0x808 0x808 0x41
+0x41 not found in [0x0808, 0x0808)
+ember> find 0x808 0x800 0x41
+range must be 0 <= lo <= hi <= 4096
+ember> find 0 4097 0
+range must be 0 <= lo <= hi <= 4096
+ember> find 0 8 300
+a byte is 0..255, got 300
+ember> find 0x800
+usage: find <lo> <hi> <byte>
+ember> quit
+```
+
+### Пошук усередині `ember`
+
+Шукає `0x41` у `[0x800, 0x808)`, друкує індекс або `-`:
+
+```txt
+адр.  байти       текст
+0000  28 00 08          LOADH H, 0x0800   ; i = lo
+0003  21 41             LOADI B, 0x41     ; що шукаємо; B більше не змінюється
+0005  29         loop:  LOAD  A, [H]      ; A = mem[i]
+0006  1A                CMP   A, B        ; Z = (mem[i] == 0x41)
+0007  31 16 00          JZ    found
+000A  2B                INCH              ; ++i
+000B  2D                HLOW              ; A = i (молодший байт H)
+000C  17                SHR   A
+000D  17                SHR   A
+000E  17                SHR   A           ; A = i / 8: 0, поки i < 8
+000F  31 05 00          JZ    loop        ; ще в ділянці
+0012  20 2D             LOADI A, '-'      ; промах
+0014  02                OUT
+0015  00                HALT
+0016  2D         found: HLOW              ; A = індекс
+0017  03                OUTN
+0018  00                HALT
+```
+
+**Як цикл дізнається, що дійшов до `hi`.** `B` увесь цикл тримає `0x41`, тому кінець перевіряється без `CMP`. Після `INCH` `HLOW` кладе в `A` молодший байт `H`; для `lo = 0x800` це індекс наступної комірки, 1..8. Три `SHR A` ділять його на 8: поки `i < 8`, виходить 0, `Z = 1`, і `JZ loop` повертає на початок. На `i = 8` (`H = 0x808 = hi`) виходить 1, `Z = 0`, і цикл закінчується, не прочитавши `mem[0x808]`.
+
+**Як він повідомляє про промах.** Знайдений індекс друкує `OUTN` — число з пробілом (`0 `…`7 `); промах — символ `-` через `OUT`, який з індексом не сплутати.
+
+Обмеження: трюк працює лише тому, що `lo = 0x800` вирівняний на 8 (молодший байт `H` і є індексом), а довжина 8 — степінь двійки. Для довільної ділянки кінець треба порівнювати через `CMP` з `hi` у `B` і на кожному колі заново класти `0x41` у `B`. Кроків: збіг на індексі `k` — `8 + 9k`, промах — 77.
+
+Знайдено (`0x41` на індексах 1 і 3 — друкується перше входження), покроково; поруч той самий пошук командою `find`:
+
+```txt
+ember> set 0x00 0x28
+ember> set16 0x01 0x0800
+ember> set 0x03 0x21
+ember> set 0x04 0x41
+ember> set 0x05 0x29
+ember> set 0x06 0x1A
+ember> set 0x07 0x31
+ember> set16 0x08 0x0016
+ember> set 0x0A 0x2B
+ember> set 0x0B 0x2D
+ember> set 0x0C 0x17
+ember> set 0x0D 0x17
+ember> set 0x0E 0x17
+ember> set 0x0F 0x31
+ember> set16 0x10 0x0005
+ember> set 0x12 0x20
+ember> set 0x13 0x2D
+ember> set 0x14 0x02
+ember> set 0x15 0x00
+ember> set 0x16 0x2D
+ember> set 0x17 0x03
+ember> set 0x18 0x00
+ember> set 0x800 0x10
+ember> set 0x801 0x41
+ember> set 0x802 0x30
+ember> set 0x803 0x41
+ember> dump 0 32
+0000  28 00 08 21 41 29 1a 31 16 00 2b 2d 17 17 17 31  |(..!A).1..+-...1|
+0010  05 00 20 2d 02 00 2d 03 00 00 00 00 00 00 00 00  |.. -..-.........|
+ember> dump 0x800 16
+0800  10 41 30 41 00 00 00 00 00 00 00 00 00 00 00 00  |.A0A............|
+ember> trace on
+ember> run
+0000  28 00 08  LOADH H, 0x0800   -> A=  0  B=  0  H=0x0800  Z=0 N=0 C=0
+0003  21 41     LOADI B, 0x41     -> A=  0  B= 65  H=0x0800  Z=0 N=0 C=0
+0005  29        LOAD A, [H]       -> A= 16  B= 65  H=0x0800  Z=0 N=0 C=0
+0006  1a        CMP A, B          -> A= 16  B= 65  H=0x0800  Z=0 N=1 C=1
+0007  31 16 00  JZ 0x0016         -> A= 16  B= 65  H=0x0800  Z=0 N=1 C=1
+000a  2b        INCH              -> A= 16  B= 65  H=0x0801  Z=0 N=1 C=1
+000b  2d        HLOW              -> A=  1  B= 65  H=0x0801  Z=0 N=1 C=1
+000c  17        SHR A             -> A=  0  B= 65  H=0x0801  Z=1 N=0 C=1
+000d  17        SHR A             -> A=  0  B= 65  H=0x0801  Z=1 N=0 C=0
+000e  17        SHR A             -> A=  0  B= 65  H=0x0801  Z=1 N=0 C=0
+000f  31 05 00  JZ 0x0005         -> A=  0  B= 65  H=0x0801  Z=1 N=0 C=0
+0005  29        LOAD A, [H]       -> A= 65  B= 65  H=0x0801  Z=1 N=0 C=0
+0006  1a        CMP A, B          -> A= 65  B= 65  H=0x0801  Z=1 N=0 C=0
+0007  31 16 00  JZ 0x0016         -> A= 65  B= 65  H=0x0801  Z=1 N=0 C=0
+0016  2d        HLOW              -> A=  1  B= 65  H=0x0801  Z=1 N=0 C=0
+1 
+0017  03        OUTN              -> A=  1  B= 65  H=0x0801  Z=1 N=0 C=0
+0018  00        HALT              -> A=  1  B= 65  H=0x0801  Z=1 N=0 C=0
+halted after 17 steps
+ember> regs
+PC=0x0019  A=1  B=65  H=0x0801  Z=1 N=0 C=0
+ember> find 0x800 0x808 0x41
+found 0x41 at 0x0801
+ember> quit
+```
+
+Промах: `0x41` лежить на `0x808`, тобто вже за `hi`:
+
+```txt
+ember> set 0x00 0x28
+ember> set16 0x01 0x0800
+ember> set 0x03 0x21
+ember> set 0x04 0x41
+ember> set 0x05 0x29
+ember> set 0x06 0x1A
+ember> set 0x07 0x31
+ember> set16 0x08 0x0016
+ember> set 0x0A 0x2B
+ember> set 0x0B 0x2D
+ember> set 0x0C 0x17
+ember> set 0x0D 0x17
+ember> set 0x0E 0x17
+ember> set 0x0F 0x31
+ember> set16 0x10 0x0005
+ember> set 0x12 0x20
+ember> set 0x13 0x2D
+ember> set 0x14 0x02
+ember> set 0x15 0x00
+ember> set 0x16 0x2D
+ember> set 0x17 0x03
+ember> set 0x18 0x00
+ember> set 0x800 1
+ember> set 0x801 2
+ember> set 0x802 3
+ember> set 0x803 4
+ember> set 0x804 5
+ember> set 0x805 6
+ember> set 0x806 7
+ember> set 0x807 8
+ember> set 0x808 0x41
+ember> dump 0x800 16
+0800  01 02 03 04 05 06 07 08 41 00 00 00 00 00 00 00  |........A.......|
+ember> run
+-
+halted after 77 steps
+ember> regs
+PC=0x0016  A=45  B=65  H=0x0808  Z=0 N=0 C=0
+ember> find 0x800 0x808 0x41
+0x41 not found in [0x0800, 0x0808)
+ember> find 0x800 0x809 0x41
+found 0x41 at 0x0808
+ember> quit
+```
+
+## Advanced
+
+### `JC` / `JNC`
+
+Рядки ISA `0x33`/`0x34` (*opt*): стрибок за прапорцем `C`. Після `CMP A, B` `C` — це позика, тобто `A < B` як беззнакові числа. Програма порівнює `A` і `B` двома способами:
+
+```txt
+адр.  байти       текст
+0000  1A          CMP A, B
+0001  33 10 00    JC 0x0010       ; A < B беззнаково?
+0004  71 20 00    JL 0x0020       ; A < B знаково?
+0007  00          HALT
+...
+0010  00          HALT            ; сюди — після JC
+...
+0020  00          HALT            ; сюди — після JL
+```
+
+`A = 1`, `B = 0x80`: `1 - 128` позичає, `C = 1`, `JC` спрацював:
+
+```txt
+ember> reg a 1
+ember> reg b 0x80
+ember> set 0x00 0x1A
+ember> set 0x01 0x33
+ember> set16 0x02 0x0010
+ember> set 0x04 0x71
+ember> set16 0x05 0x0020
+ember> set 0x07 0x00
+ember> set 0x10 0x00
+ember> set 0x20 0x00
+ember> trace on
+ember> run
+0000  1a        CMP A, B          -> A=  1  B=128  H=0x0000  Z=0 N=1 C=1
+0001  33 10 00  JC 0x0010         -> A=  1  B=128  H=0x0000  Z=0 N=1 C=1
+0010  00        HALT              -> A=  1  B=128  H=0x0000  Z=0 N=1 C=1
+halted after 3 steps
+ember> regs
+PC=0x0011  A=1  B=128  H=0x0000  Z=0 N=1 C=1
+ember> quit
+```
+
+### `JG` / `JL` — власні розширення
+
+Визначення: `JG addr16` (`0x70`) стрибає, якщо `A > B`, а `JL addr16` (`0x71`) — якщо `A < B`, де обидва байти читаються як знакові числа в доповняльному коді, −128..127 (`0x80`..`0xFF` — це −128..−1). Обидві інструкції порівнюють `A` і `B` самі; прапорці не читають і не змінюють. Байт у знакове число перетворюю явно: `static_cast<std::int8_t>(200)` у C++17 залежить від реалізації (визначеним це стало лише в C++20):
+
+```cpp
+// A byte read as two's complement, -128..127, for JG/JL. Spelled out because
+// static_cast<std::int8_t>(200) is implementation-defined before C++20.
+static int as_signed(Byte v) { return v < 128 ? v : v - 256; }
+```
+
+```cpp
+        case Op::Jl:
+            if (as_signed(cpu.a) < as_signed(cpu.b) && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+```
+
+Чому не «знак за `N` після `CMP`»: `N` — старший біт 8-бітного результату `A - B`, а знакова різниця може не влізти в −128..127:
+
+```txt
+ember> alu sub 128 1
+result=127  Z=0 N=0 C=0
+ember> alu sub 127 255
+result=128  Z=0 N=1 C=1
+ember> quit
+```
+
+- `A = 0x80` (−128), `B = 1`: −128 − 1 = −129, у байт не влазить, результат `0x7F` = 127, `N = 0` — «за `N`» `A >= B`, а насправді −128 < 1.
+- `A = 0x7F` (127), `B = 0xFF` (−1): 127 − (−1) = 128, результат `0x80`, `N = 1` — «за `N`» `A < B`, а насправді 127 > −1.
+
+Тому справжні процесори мають прапорець переповнення `V` (`OF` на x86): він виставляється, коли знаковий результат не вліз — у віднімання це буває, коли `A` і `B` різних знаків, а знак результату не збігається зі знаком `A`. Знакове «менше» після `CMP` — `N ≠ V` (x86 `JL`: `SF ≠ OF`; ARM `LT`: `N ≠ V`), «більше» — `Z = 0` і `N = V`. В `ember` прапорця `V` немає, тому `JG`/`JL` порівнюють `A` і `B` самі. Цим вони відрізняються від x86 `JG`/`JL`, які читають прапорці, залишені попереднім `cmp`.
+
+Перший контрприклад у ділі (та сама програма, що вище): `CMP` дає `N=0 C=0`, `JC` не спрацював (128 ≥ 1 беззнаково), `JL` спрацював (−128 < 1):
+
+```txt
+ember> reg a 0x80
+ember> reg b 1
+ember> set 0x00 0x1A
+ember> set 0x01 0x33
+ember> set16 0x02 0x0010
+ember> set 0x04 0x71
+ember> set16 0x05 0x0020
+ember> set 0x07 0x00
+ember> set 0x10 0x00
+ember> set 0x20 0x00
+ember> trace on
+ember> run
+0000  1a        CMP A, B          -> A=128  B=  1  H=0x0000  Z=0 N=0 C=0
+0001  33 10 00  JC 0x0010         -> A=128  B=  1  H=0x0000  Z=0 N=0 C=0
+0004  71 20 00  JL 0x0020         -> A=128  B=  1  H=0x0000  Z=0 N=0 C=0
+0020  00        HALT              -> A=128  B=  1  H=0x0000  Z=0 N=0 C=0
+halted after 4 steps
+ember> regs
+PC=0x0021  A=128  B=1  H=0x0000  Z=0 N=0 C=0
+ember> quit
+```
+
+`JNC` і `JG`:
+
+```txt
+адр.  байти       текст
+0000  1A          CMP A, B
+0001  34 10 00    JNC 0x0010      ; A >= B беззнаково?
+0004  70 20 00    JG 0x0020       ; A > B знаково?
+0007  00          HALT
+...
+0010  00          HALT
+...
+0020  00          HALT
+```
+
+`A = 1`, `B = 0x80`: беззнаково `1 < 128`, `C = 1` — `JNC` не спрацював; знаково `1 > −128` — `JG` спрацював, хоча `N = 1`:
+
+```txt
+ember> reg a 1
+ember> reg b 0x80
+ember> set 0x00 0x1A
+ember> set 0x01 0x34
+ember> set16 0x02 0x0010
+ember> set 0x04 0x70
+ember> set16 0x05 0x0020
+ember> set 0x07 0x00
+ember> set 0x10 0x00
+ember> set 0x20 0x00
+ember> trace on
+ember> run
+0000  1a        CMP A, B          -> A=  1  B=128  H=0x0000  Z=0 N=1 C=1
+0001  34 10 00  JNC 0x0010        -> A=  1  B=128  H=0x0000  Z=0 N=1 C=1
+0004  70 20 00  JG 0x0020         -> A=  1  B=128  H=0x0000  Z=0 N=1 C=1
+0020  00        HALT              -> A=  1  B=128  H=0x0000  Z=0 N=1 C=1
+halted after 4 steps
+ember> regs
+PC=0x0021  A=1  B=128  H=0x0000  Z=0 N=1 C=1
+ember> quit
+```
+
+### Точка зупину `b <addr>`
+
+Одна точка; її адреса — змінна в `main()`, як `trace`. `run` перевіряє `PC == addr` перед кожним кроком, крім першого кроку цього `run`: інакше повторний `run` стояв би на місці (як `continue` у відладчику). `step` точку не враховує. Зворотний відлік з точкою на `JNZ`:
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x03
+ember> set 2 0x03
+ember> set 3 0x19
+ember> set 4 0x32
+ember> set 5 0x02
+ember> set 6 0x00
+ember> set 7 0x00
+ember> b 4096
+address 4096 is outside 0..4095
+ember> b 4
+breakpoint at 0x0004
+ember> run
+3 
+breakpoint at 0x0004
+stopped after 3 steps
+ember> regs
+PC=0x0004  A=2  B=0  H=0x0000  Z=0 N=0 C=0
+ember> run
+2 
+breakpoint at 0x0004
+stopped after 3 steps
+ember> b off
+no breakpoint
+ember> run
+1 
+halted after 5 steps
+ember> regs
+PC=0x0008  A=0  B=0  H=0x0000  Z=1 N=0 C=0
+ember> quit
+```
+
+### Godbolt — вкладений цикл
+
+```cpp
+int count(int n) {
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < i; ++j) {
+            s += j;
+        }
+    }
+    return s;
+}
+```
+
+Compiler Explorer, компілятор `g162` (x86-64 gcc 16.2), `-O0`, фільтри `intel`, `directives`, `labels`, `commentOnly`, `demangle` — запит через API:
+
+`body.json`:
+
+```json
+{
+  "source": "int count(int n) {\n    int s = 0;\n    for (int i = 0; i < n; ++i) {\n        for (int j = 0; j < i; ++j) {\n            s += j;\n        }\n    }\n    return s;\n}\n",
+  "options": {
+    "userArguments": "-O0",
+    "filters": {"intel": true, "directives": true, "labels": true, "commentOnly": true, "demangle": true}
+  }
+}
+```
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' -H 'Accept: text/plain' \
+     --data @body.json https://godbolt.org/api/compiler/g162/compile
+```
+
+```txt
+# Compilation provided by Compiler Explorer at https://godbolt.org/
+"count(int)":
+        push    rbp
+        mov     rbp, rsp
+        mov     DWORD PTR [rbp-20], edi
+        mov     DWORD PTR [rbp-4], 0
+        mov     DWORD PTR [rbp-8], 0
+        jmp     .L2
+.L5:
+        mov     DWORD PTR [rbp-12], 0
+        jmp     .L3
+.L4:
+        mov     eax, DWORD PTR [rbp-12]
+        add     DWORD PTR [rbp-4], eax
+        add     DWORD PTR [rbp-12], 1
+.L3:
+        mov     eax, DWORD PTR [rbp-12]
+        cmp     eax, DWORD PTR [rbp-8]
+        jl      .L4
+        add     DWORD PTR [rbp-8], 1
+.L2:
+        mov     eax, DWORD PTR [rbp-8]
+        cmp     eax, DWORD PTR [rbp-20]
+        jl      .L5
+        mov     eax, DWORD PTR [rbp-4]
+        pop     rbp
+        ret
+```
+
+| Інструкції | Частина циклу |
+|---|---|
+| `mov DWORD PTR [rbp-8], 0` · `jmp .L2` | `i = 0`, одразу на перевірку `i < n` унизу |
+| `.L5:` `mov DWORD PTR [rbp-12], 0` · `jmp .L3` | тіло зовнішнього циклу: `j = 0`, одразу на перевірку `j < i` |
+| `.L4:` `mov` · `add DWORD PTR [rbp-4], eax` · `add DWORD PTR [rbp-12], 1` | `s += j`, `++j` |
+| `.L3:` `cmp eax, DWORD PTR [rbp-8]` · `jl .L4` | `j < i` — назад на тіло внутрішнього |
+| `add DWORD PTR [rbp-8], 1` | `++i` |
+| `.L2:` `cmp eax, DWORD PTR [rbp-20]` · `jl .L5` | `i < n` — назад на тіло зовнішнього |
+
+Обидва `for` зібрані так само, як наш відлік: перевірка внизу і умовний стрибок назад (`jl` ↔ `JNZ loop`), а `jmp` перед циклом (↔ наш `JMP`) перескакує на перевірку, щоб при `n <= 0` тіло не виконалось жодного разу — так `for` стає `do-while` з вхідним стрибком. `cmp` ↔ наш `CMP`. `jl` — знакове «менше» для `int`, тобто наш `JL`, тільки x86 бере його з прапорців `cmp` (`SF ≠ OF`).
+
+## Якщо встигаєте
+
+`JG`/`JL` зі знаковим порівнянням (і чому потрібен прапорець переповнення), вкладений цикл у Godbolt і `b <addr>` — у розділі Advanced вище. `HLOW` (ISA *opt*, Лаба 4) реалізований у Лабі 3 і стоїть у її таблиці; тут ним користується програма пошуку.
+
+## Реалізовані рядки [ISA.uk.md](https://github.com/rmalkevy/Programming-Practice-Projects/blob/main/courses/programming-fundamentals/ISA.uk.md) (Лаба 4)
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x1A` | `CMP A, B` | 1 | Z N C | порахувати `A - B`, виставити прапорці, **результат викинути** | 4 |
+| `0x30` | `JMP addr16` | 3 | — | стрибнути завжди | 4 |
+| `0x31` | `JZ addr16` | 3 | — | стрибнути, якщо `Z` виставлений | 4 |
+| `0x32` | `JNZ addr16` | 3 | — | стрибнути, якщо `Z` не виставлений | 4 |
+| `0x33` | `JC addr16` | 3 | — | *opt* стрибнути, якщо `C` виставлений | 4 |
+| `0x34` | `JNC addr16` | 3 | — | *opt* стрибнути, якщо `C` не виставлений | 4 |
+
+Стрибок, що спрацював: `PC = addr16`, розмір не додається; ціль `>= 4096` — помилка на самому стрибку.
+
+## Власні розширення
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x70` | `JG addr16` | 3 | — | стрибнути, якщо `A > B` як знакові числа (−128..127); прапорці не читає й не змінює | 4 |
+| `0x71` | `JL addr16` | 3 | — | стрибнути, якщо `A < B` як знакові числа (−128..127); прапорці не читає й не змінює | 4 |
+
+Номери — з вільного діапазону `0x70`–`0xFF` (ISA §8); жоден рядок ISA не перевизначений. Байт стану `0xB00` — як у Lab 02, без змін.

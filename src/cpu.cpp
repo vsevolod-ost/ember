@@ -1,4 +1,4 @@
-// cpu.cpp — fetch mem[pc], decode, execute, advance pc by the ISA size.
+// cpu.cpp — fetch mem[pc], decode, execute, advance pc by the ISA size (or jump).
 #include "cpu.hpp"
 
 #include <iomanip>
@@ -29,6 +29,7 @@ std::uint16_t instr_size(Byte op) {
     case Op::Shr:
     case Op::Inc:
     case Op::Dec:
+    case Op::Cmp:
     case Op::MovAB:
     case Op::MovBA:
     case Op::LoadAH:
@@ -45,9 +46,17 @@ std::uint16_t instr_size(Byte op) {
     case Op::StoreA:
     case Op::StoreB:
     case Op::LoadH:
+    case Op::Jmp:
+    case Op::Jz:
+    case Op::Jnz:
+    case Op::Jc:
+    case Op::Jnc:
+    case Op::Jg:
+    case Op::Jl:
         return 3; // opcode, then a 16-bit operand low byte first
+    default:
+        return 0; // no ISA row (yet): the first place an unknown opcode is caught
     }
-    return 0;
 }
 
 std::string hex(unsigned v, int digits) {
@@ -88,6 +97,8 @@ static std::string mnemonic(Op op, Byte imm8, std::uint16_t w16) {
         return "INC A";
     case Op::Dec:
         return "DEC A";
+    case Op::Cmp:
+        return "CMP A, B";
     case Op::LoadiA:
         return "LOADI A, " + hex(imm8, 2);
     case Op::LoadiB:
@@ -116,6 +127,20 @@ static std::string mnemonic(Op op, Byte imm8, std::uint16_t w16) {
         return "DECH";
     case Op::HLow:
         return "HLOW";
+    case Op::Jmp:
+        return "JMP " + hex(w16, 4);
+    case Op::Jz:
+        return "JZ " + hex(w16, 4);
+    case Op::Jnz:
+        return "JNZ " + hex(w16, 4);
+    case Op::Jc:
+        return "JC " + hex(w16, 4);
+    case Op::Jnc:
+        return "JNC " + hex(w16, 4);
+    case Op::Jg:
+        return "JG " + hex(w16, 4);
+    case Op::Jl:
+        return "JL " + hex(w16, 4);
     }
     return "?";
 }
@@ -147,6 +172,20 @@ static bool guest_read(const CPU& cpu, std::size_t addr, Byte& out) {
 static bool guest_write(CPU& cpu, std::size_t addr, Byte value) {
     return mem_set(*cpu.mem, addr, value); // false (nothing written) if addr >= MEM_SIZE
 }
+
+// A taken jump: the next instruction is at `target`, not after this one (no
+// "+ size"). A target outside the box is refused like a bad LOAD/STORE
+// address; an untaken jump never looks at it.
+static bool jump_to(std::uint16_t target, std::uint16_t& next) {
+    if (target >= MEM_SIZE)
+        return false;
+    next = target;
+    return true;
+}
+
+// A byte read as two's complement, -128..127, for JG/JL. Spelled out because
+// static_cast<std::int8_t>(200) is implementation-defined before C++20.
+static int as_signed(Byte v) { return v < 128 ? v : v - 256; }
 
 static void print_flags(const Flags& f) {
     std::cout << "Z=" << f.z << " N=" << f.n << " C=" << f.c;
@@ -196,9 +235,13 @@ StepResult step(CPU& cpu, bool trace) {
     const Byte imm8 = bytes[1];
     const Decoded d = decode(op);
     Byte v = 0;
+    // Where PC goes after this instruction: the next one, unless a jump is taken.
+    std::uint16_t next = static_cast<std::uint16_t>(at + size);
 
-    // Every error path returns before anything is changed. The 0x0_ and 0x2_
-    // rows never touch the flags (ISA §3).
+    // Every error path returns before anything is changed. Each known opcode
+    // has its own case; every default is the second place an unknown opcode
+    // is caught (after instr_size). The 0x0_, 0x2_, 0x3_ and 0x7_ rows never
+    // touch the flags (ISA §3).
     switch (d.group) {
     case 0x0:
         switch (static_cast<Op>(op)) {
@@ -249,6 +292,9 @@ StepResult step(CPU& cpu, bool trace) {
         case Op::Dec:
             cpu.a = alu_dec(cpu.a, cpu.f);
             break;
+        case Op::Cmp:
+            alu_sub(cpu.a, cpu.b, cpu.f); // only the flags; A keeps its value
+            break;
         default:
             return StepResult::bad_opcode;
         }
@@ -262,10 +308,14 @@ StepResult step(CPU& cpu, bool trace) {
             cpu.b = imm8;
             break;
         case Op::LoadA:
+            if (!guest_read(cpu, w16, v))
+                return StepResult::bad_address;
+            cpu.a = v;
+            break;
         case Op::LoadB:
             if (!guest_read(cpu, w16, v))
                 return StepResult::bad_address;
-            (static_cast<Op>(op) == Op::LoadA ? cpu.a : cpu.b) = v;
+            cpu.b = v;
             break;
         case Op::StoreA:
             if (!guest_write(cpu, w16, cpu.a))
@@ -308,11 +358,54 @@ StepResult step(CPU& cpu, bool trace) {
             return StepResult::bad_opcode;
         }
         break;
+    case 0x3:
+        switch (static_cast<Op>(op)) {
+        case Op::Jmp:
+            if (!jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+        case Op::Jz:
+            if (cpu.f.z && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+        case Op::Jnz:
+            if (!cpu.f.z && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+        case Op::Jc:
+            if (cpu.f.c && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+        case Op::Jnc:
+            if (!cpu.f.c && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+        default:
+            return StepResult::bad_opcode;
+        }
+        break;
+    case 0x7:
+        // Own extensions: compare A and B themselves as signed numbers. The
+        // flags cannot say this alone: N of A - B is wrong when the
+        // subtraction overflows (A = -128, B = 1 gives 0x7F, N = 0).
+        switch (static_cast<Op>(op)) {
+        case Op::Jg:
+            if (as_signed(cpu.a) > as_signed(cpu.b) && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+        case Op::Jl:
+            if (as_signed(cpu.a) < as_signed(cpu.b) && !jump_to(w16, next))
+                return StepResult::bad_address;
+            break;
+        default:
+            return StepResult::bad_opcode;
+        }
+        break;
     default:
         return StepResult::bad_opcode;
     }
 
-    cpu.pc = static_cast<std::uint16_t>(at + size);
+    cpu.pc = next;
     mem_set(*cpu.mem, STATUS_ADDR, static_cast<Byte>((cpu.f.z << 2) | (cpu.f.n << 1) | cpu.f.c));
 
     if (trace)

@@ -40,7 +40,8 @@ enum class StepResult {
     halted,        // HALT was executed earlier; nothing happened
     bad_opcode,    // not in the ISA rows implemented so far; nothing happened
     out_of_memory, // the instruction at PC does not fit below MEM_SIZE; nothing happened
-    bad_address,   // a LOAD/STORE operand (addr16 or H) is >= MEM_SIZE; nothing happened
+    bad_address,   // a LOAD/STORE operand (addr16 or H) or a taken jump's target is
+                   // >= MEM_SIZE; nothing happened
 };
 
 // Execute the instruction at PC. With `trace`, print one line for it.
@@ -52,7 +53,8 @@ std::string hex(unsigned v, int digits);
 // The instruction at `at` as text, operands filled in: "LOAD A, [0x0800]".
 std::string disasm(const Memory& mem, std::uint16_t at);
 
-// The guest address the LOAD/STORE at PC reads or writes (addr16 or H).
+// The guest address the instruction at PC uses: what a LOAD/STORE reads or
+// writes (addr16 or H), where a jump goes (addr16).
 std::uint16_t data_address(const CPU& cpu);
 
 // Print PC A B H Z N C on one line.

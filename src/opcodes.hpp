@@ -21,6 +21,7 @@ enum class Op : std::uint8_t {
     Shr = 0x17,
     Inc = 0x18,
     Dec = 0x19,
+    Cmp = 0x1A, // A - B for the flags only; A is kept (Lab 4)
     // 0x2_ — data movement (Lab 3 rows; HLOW is *opt*, Lab 4, done early)
     LoadiA = 0x20,
     LoadiB = 0x21,
@@ -36,4 +37,13 @@ enum class Op : std::uint8_t {
     IncH = 0x2B,
     DecH = 0x2C,
     HLow = 0x2D, // A = H & 0xFF
+    // 0x3_ — jumps, operand addr16 (Lab 4; JC/JNC are *opt*)
+    Jmp = 0x30,
+    Jz = 0x31,
+    Jnz = 0x32,
+    Jc = 0x33,
+    Jnc = 0x34,
+    // 0x7_ — own extensions (ISA §8: 0x70-0xFF are free), Lab 4
+    Jg = 0x70, // jump if A > B as signed bytes (-128..127); flags untouched
+    Jl = 0x71, // jump if A < B as signed bytes (-128..127); flags untouched
 };
