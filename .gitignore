@@ -5,3 +5,6 @@ build/
 *.dSYM/
 scratch
 scratch.cpp
+
+# Instructor posts for each lab: kept locally, not part of the submission.
+task-*.md
