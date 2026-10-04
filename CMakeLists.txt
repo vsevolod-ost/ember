@@ -11,6 +11,8 @@ add_executable(ember
     src/dump.cpp
     src/alu.cpp
     src/cpu.cpp
+    src/guest_io.cpp
+    src/hexdump.cpp
 )
 
 target_compile_options(ember PRIVATE -Wall -Wextra -Werror)

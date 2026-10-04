@@ -20,3 +20,22 @@ bool mem_set(Memory& mem, std::size_t addr, Byte value) {
     mem.data[addr] = value;
     return true;
 }
+
+// ДАНО. Прочитати два байти як одне 16-бітне значення, молодший перший.
+std::uint16_t get16(const Memory& mem, std::size_t addr) {
+    Byte lo = mem_get(mem, addr);
+    Byte hi = mem_get(mem, addr + 1);
+    return (std::uint16_t)(lo | (hi << 8));
+}
+
+bool set16(Memory& mem, std::size_t addr, std::uint16_t value) {
+    // Both cells must fit. `addr >= MEM_SIZE - 1` is `addr + 1 >= MEM_SIZE`
+    // without the + 1, so a huge addr cannot wrap around. Checked before any
+    // write: a refused set16 changes nothing.
+    if (addr >= MEM_SIZE - 1)
+        return false;
+    // The mirror of get16: low byte first, at the lower address.
+    mem_set(mem, addr, static_cast<Byte>(value & 0xFF));
+    mem_set(mem, addr + 1, static_cast<Byte>(value >> 8));
+    return true;
+}
