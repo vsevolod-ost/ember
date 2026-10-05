@@ -89,3 +89,15 @@ Byte alu_dec(Byte a, Flags& f) {
     set_zn(r, f);
     return r;
 }
+
+// The core is one line: a and b become int (255 * 255 = 65025 fits, no
+// overflow), the product is exact, and the cast keeps the low 8 bits. Not
+// bit by bit like alu_add: a multiplier is shifts and adds, and Lab 7's
+// Advanced builds one from ADD as a guest subroutine.
+Byte alu_mul(Byte a, Byte b, Flags& f) {
+    const unsigned p = static_cast<unsigned>(a * b);
+    const Byte r = static_cast<Byte>(p);
+    f.c = p > 0xFF;
+    set_zn(r, f);
+    return r;
+}

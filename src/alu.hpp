@@ -20,3 +20,4 @@ Byte alu_shl(Byte a, Flags& f);         // Z N C, C = old bit 7
 Byte alu_shr(Byte a, Flags& f);         // Z N C, C = old bit 0
 Byte alu_inc(Byte a, Flags& f);         // Z N
 Byte alu_dec(Byte a, Flags& f);         // Z N
+Byte alu_mul(Byte a, Byte b, Flags& f); // Z N C, C = the true product > 255 (Lab 7)

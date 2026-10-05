@@ -64,6 +64,10 @@ bool print_layout(const std::string& what) {
             {"ticks", offsetof(CPU, ticks), sizeof(CPU::ticks)},
             {"heap_ptr", offsetof(CPU, heap_ptr), sizeof(CPU::heap_ptr)},
             {"free_head", offsetof(CPU, free_head), sizeof(CPU::free_head)},
+            // The Stack inside CPU, field by field (Lab 7).
+            {"stack.sp", offsetof(CPU, stack) + offsetof(Stack, sp), sizeof(Stack::sp)},
+            {"stack.low", offsetof(CPU, stack) + offsetof(Stack, low), sizeof(Stack::low)},
+            {"stack.top", offsetof(CPU, stack) + offsetof(Stack, top), sizeof(Stack::top)},
         };
         print_struct("CPU", sizeof(CPU), alignof(CPU), f, std::size(f));
     }

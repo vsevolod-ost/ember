@@ -7,6 +7,7 @@
 #include "alu.hpp"
 #include "memory.hpp"
 #include "opcodes.hpp"
+#include "stack.hpp"
 
 // The spare region 0xB00-0xBFF (ISA §2). Two addresses do something when the
 // GUEST touches them (*opt*, Lab 5); for the host they are plain memory.
@@ -36,6 +37,9 @@ struct CPU {
     // heap_ptr needs an even address, so one padding byte sits before it.
     std::uint16_t heap_ptr = HEAP_LO; // the next fresh block starts here (ALLOC)
     std::uint16_t free_head = 0;      // first block of the free list (FREE); 0 = none
+    // The guest stack (Lab 7): SP and its bytes. Only through stack.hpp; SP
+    // is a register of the ISA, so `regs` shows it.
+    Stack stack{};
 };
 
 // What step read at PC before executing it: the ISA row and the bytes.
@@ -62,13 +66,16 @@ std::uint16_t instr_size(Byte op);
 
 enum class StepResult {
     ok,
-    halted,        // HALT was executed earlier; nothing happened
-    bad_opcode,    // not in the ISA rows implemented so far; nothing happened
-    out_of_memory, // the instruction at PC does not fit below MEM_SIZE; nothing happened
-    bad_address,   // a LOAD/STORE operand (addr16 or H), an OUTS operand or a taken
-                   // jump's target is >= MEM_SIZE; nothing happened
-    bad_heap,      // ALLOC/FREE found the free list broken (the guest wrote into a
-                   // freed block); nothing happened
+    halted,          // HALT was executed earlier; nothing happened
+    bad_opcode,      // not in the ISA rows implemented so far; nothing happened
+    out_of_memory,   // the instruction at PC does not fit below MEM_SIZE; nothing happened
+    bad_address,     // a LOAD/STORE operand (addr16 or H), an OUTS operand, a taken
+                     // jump's or CALL's target or the address RET would pop is
+                     // >= MEM_SIZE; nothing happened
+    bad_heap,        // ALLOC/FREE found the free list broken (the guest wrote into a
+                     // freed block); nothing happened
+    stack_overflow,  // PUSH/CALL: no room below SP for its bytes; nothing happened
+    stack_underflow, // POP/RET: not enough bytes on the stack; nothing happened
 };
 
 // Every byte the GUEST reads or writes by address goes through these two:
@@ -88,8 +95,13 @@ std::string hex(unsigned v, int digits);
 std::string disasm(const Memory& mem, std::uint16_t at);
 
 // The guest address the instruction at PC uses: what a LOAD/STORE reads or
-// writes (addr16 or H), where OUTS starts, where a jump goes (addr16).
+// writes (addr16 or H), where OUTS starts, where a jump or CALL goes
+// (addr16), where RET would go (the address on top of the stack).
 std::uint16_t data_address(const CPU& cpu);
 
-// Print PC A B H Z N C on one line.
+// How many stack bytes the instruction at PC pushes or pops: 1 for PUSH/POP
+// A/B, 2 for CALL/RET/PUSH H/POP H, 0 for any other.
+std::uint16_t stack_bytes(const CPU& cpu);
+
+// Print PC A B H SP Z N C on one line.
 void dump_regs(const CPU& cpu);

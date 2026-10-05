@@ -21,10 +21,12 @@
 #include "hexdump.hpp"
 #include "layout.hpp"
 #include "memory.hpp"
+#include "messages.hpp"
 #include "run.hpp"
 #include "search.hpp"
 #include "sort.hpp"
 #include "sprite.hpp"
+#include "stack.hpp"
 #include "value.hpp"
 
 // Turn a word into a number. Accepts decimal (65) and hex (0x41).
@@ -62,6 +64,8 @@ static bool alu_by_name(const std::string& name, Byte a, Byte b, Byte& r, Flags&
         r = alu_inc(a, f);
     else if (name == "dec")
         r = alu_dec(a, f);
+    else if (name == "mul")
+        r = alu_mul(a, b, f);
     else
         return false;
     return true;
@@ -80,62 +84,6 @@ static std::string second_word(const std::string& line) {
 static bool past_the_box(const std::string& word) {
     long addr = 0;
     return parse_number(word, addr) && addr >= 0 && static_cast<std::size_t>(addr) >= MEM_SIZE;
-}
-
-static void report(StepResult r, const CPU& cpu) {
-    guest_end_line(); // never glue a message to guest output
-    switch (r) {
-    case StepResult::ok:
-        break;
-    case StepResult::halted:
-        std::cout << "halted: step does nothing after HALT\n";
-        break;
-    case StepResult::bad_opcode:
-        std::cout << "unknown opcode " << hex(mem_get(*cpu.mem, cpu.pc), 2) << " at "
-                  << hex(cpu.pc, 4) << "; nothing done\n";
-        break;
-    case StepResult::out_of_memory:
-        std::cout << "instruction at " << hex(cpu.pc, 4) << " does not fit in 0.." << MEM_SIZE - 1
-                  << "; nothing done\n";
-        break;
-    case StepResult::bad_address:
-        std::cout << "address " << hex(data_address(cpu), 4) << " is outside 0.." << MEM_SIZE - 1
-                  << " (" << disasm(*cpu.mem, cpu.pc) << " at " << hex(cpu.pc, 4)
-                  << "); nothing done\n";
-        break;
-    case StepResult::bad_heap: {
-        // Nothing changed, so the same walk finds the same bad node.
-        std::uint16_t bad = 0;
-        heap_check(cpu, bad);
-        std::cout << "free list is broken at " << hex(bad, 4) << " (" << disasm(*cpu.mem, cpu.pc)
-                  << " at " << hex(cpu.pc, 4) << "); nothing done\n";
-        break;
-    }
-    }
-}
-
-// Why heap_alloc/heap_free said no, for `alloc` and `free`: "not freed: ...".
-static void print_heap_refusal(const char* what, HeapResult r, const CPU& cpu) {
-    std::uint16_t bad = 0;
-    switch (r) {
-    case HeapResult::ok:
-    case HeapResult::no_room:
-        break;
-    case HeapResult::bad_block:
-        std::cout << what << ": not a used heap block; nothing done\n";
-        break;
-    case HeapResult::already_free:
-        std::cout << what << ": already free; nothing done\n";
-        break;
-    case HeapResult::too_small:
-        std::cout << what << ": too small for a list node (" << NODE_SIZE
-                  << " bytes); nothing done\n";
-        break;
-    case HeapResult::broken_list:
-        heap_check(cpu, bad);
-        std::cout << what << ": free list is broken at " << hex(bad, 4) << "; nothing done\n";
-        break;
-    }
 }
 
 // The kind named by a word of `value`; false for any other word.
@@ -158,66 +106,13 @@ static void print_sprite(int i, const Memory& mem, const Sprite sprites[]) {
         print_value(v, mem, sprites);
 }
 
-static void print_help() {
-    std::cout << "commands:\n"
-              << "  dump              print all " << MEM_SIZE << " bytes\n"
-              << "  dump <addr> [n]   print the rows holding n bytes from addr (n=16)\n"
-              << "  get <addr>        show one byte four ways\n"
-              << "  get16 <addr>      read a 16-bit value, little-endian\n"
-              << "  set <addr> <val>  write one byte (dec or 0x hex)\n"
-              << "  set16 <addr> <v>  write a 16-bit value, little-endian\n"
-              << "  reg <a|b> <v>     put 0..255 into register A or B\n"
-              << "  reg <pc|h> <v>    put 0..65535 into PC or H\n"
-              << "  inc <addr>        add one to a byte (wraps 255 -> 0)\n"
-              << "  alu <op> <a> [b]  add sub and or xor (a b); not shl shr inc dec (a)\n"
-              << "  regs              print PC A B H Z N C\n"
-              << "  step              execute one instruction at PC, print its trace\n"
-              << "  run               step until HALT, an error, the breakpoint or "
-              << RUN_STEP_LIMIT << " steps\n"
-              << "  trace <on|off>    also print a trace line per step in run (off)\n"
-              << "  b <addr> | b off  stop run before the instruction at addr; b alone = off\n"
-              << "  find <lo> <hi> <byte>\n"
-              << "                    first address in [lo, hi) that holds byte\n"
-              << "  find <lo> <hi> !<byte>\n"
-              << "                    first address in [lo, hi) that does not hold byte\n"
-              << "  show              draw the screen: VRAM 0xA00-0xAFF, 64x32, # = lit\n"
-              << "  cls               turn every pixel off (256 zero bytes)\n"
-              << "  plot <x> <y>      light a pixel, x 0..63, y 0..31\n"
-              << "  unplot <x> <y>    turn a pixel off\n"
-              << "  frame             draw a border around the screen\n"
-              << "  rowmin <y>        the leftmost lit pixel in row y\n"
-              << "  sort <lo> <hi> [bubble|insert] [show]\n"
-              << "                    sort the bytes of [lo, hi) in place (bubble);\n"
-              << "                    show: draw them as columns after every pass\n"
-              << "  anim <steps> <frames>\n"
-              << "                    run at most steps steps, then show; frames times\n"
-              << "  hostdump <cpu|sprites>\n"
-              << "                    the host's CPU struct or sprites array as raw bytes\n"
-              << "  layout [cpu|flags|instruction|sprite|value]\n"
-              << "                    offset and size of each field, padding, sizeof\n"
-              << "  sprite <i> <x> <y> <vx> <vy>\n"
-              << "                    set host sprite i (0..7) alive: x 0..63, y 0..31,\n"
-              << "                    vx -63..63, vy -31..31; redraw VRAM\n"
-              << "  sprite <i> off    kill sprite i; redraw VRAM\n"
-              << "  sprites           list all " << SPRITE_COUNT << " sprites\n"
-              << "  tick [n]          n times (1..100, 1): move alive sprites, bounce, show\n"
-              << "  heap              guest heap " << hex(HEAP_LO, 4) << '-' << hex(HEAP_HI, 4)
-              << ": heap_ptr and the free list\n"
-              << "  alloc <n>         ALLOC n bytes (0..255) as the host; registers untouched\n"
-              << "  free <addr> <n>   FREE n bytes at addr as the host; registers untouched\n"
-              << "  value <byte|addr|sprite> <n>\n"
-              << "                    make a tagged Value and print it by its tag\n"
-              << "  help              this list\n"
-              << "  quit              leave\n";
-}
-
 int main() {
     Memory mem; // 4096 bytes, on the stack, zeroed by the {} in memory.hpp
     CPU cpu{&mem};
     // Lab 6: eight host records; the {} makes every field 0, so all are dead.
     Sprite sprites[SPRITE_COUNT]{};
-    bool trace = false;   // `trace on`: run prints a line per step, like step
-    long breakpoint = -1; // `b <addr>`: run stops when PC gets there; -1 = none
+    Trace trace = Trace::off; // `trace on|calls`: run prints a line per step / per CALL and RET
+    long breakpoint = -1;     // `b <addr>`: run stops when PC gets there; -1 = none
 
     std::cout << "ember 0.1 - 4096 bytes of memory you can see. Type `help`.\n";
 
@@ -324,6 +219,20 @@ int main() {
                           << static_cast<std::size_t>(addr) + 1 << "; the box is 0.."
                           << MEM_SIZE - 1 << '\n';
             }
+        } else if (cmd == "reg" && second_word(line) == "sp") {
+            // SP is 16 bits but only the stack region makes sense for it.
+            std::string r, v, extra;
+            long value = 0;
+            words >> r;
+            if (!(words >> v) || words >> extra || !parse_number(v, value) || value < 0 ||
+                value > 0xFFFF) {
+                std::cout << "usage: reg sp <" << hex(STACK_LO - 1, 4) << ".." << hex(STACK_HI, 4)
+                          << ">\n";
+            } else if (!stack_set_sp(cpu, static_cast<std::uint16_t>(value))) {
+                std::cout << "SP is " << hex(STACK_LO - 1, 4) << ".." << hex(STACK_HI, 4)
+                          << " (stack " << hex(STACK_LO, 4) << '-' << hex(STACK_HI, 4) << "), got "
+                          << hex(static_cast<unsigned>(value), 4) << '\n';
+            }
         } else if (cmd == "reg" && (second_word(line) == "pc" || second_word(line) == "h")) {
             // The given `reg` below sets the 8-bit A and B; PC and H are 16-bit.
             std::string r, v;
@@ -370,8 +279,8 @@ int main() {
             words >> name >> x;
             const bool one =
                 name == "not" || name == "shl" || name == "shr" || name == "inc" || name == "dec";
-            const bool two =
-                name == "add" || name == "sub" || name == "and" || name == "or" || name == "xor";
+            const bool two = name == "add" || name == "sub" || name == "and" || name == "or" ||
+                             name == "xor" || name == "mul";
             Byte r = 0;
             Flags f{};
             if (!name.empty() && !one && !two) {
@@ -411,11 +320,13 @@ int main() {
             std::string v;
             words >> v;
             if (v == "on")
-                trace = true;
+                trace = Trace::on;
             else if (v == "off")
-                trace = false;
+                trace = Trace::off;
+            else if (v == "calls")
+                trace = Trace::calls;
             else
-                std::cout << "usage: trace <on|off>\n";
+                std::cout << "usage: trace <on|off|calls>\n";
         } else if (cmd == "b") {
             // One breakpoint; `b` and `b off` clear it. `step` ignores it.
             std::string a, extra;
@@ -671,6 +582,15 @@ int main() {
                     show(mem);
                 }
             }
+        } else if (cmd == "stack") {
+            std::string ns, extra;
+            long n = 8;
+            if ((words >> ns && !parse_number(ns, n)) || words >> extra || n < 1 ||
+                static_cast<std::size_t>(n) > STACK_HI + 1 - STACK_LO) {
+                std::cout << "usage: stack [1.." << STACK_HI + 1 - STACK_LO << "]\n";
+            } else {
+                stack_print(cpu, static_cast<std::size_t>(n));
+            }
         } else if (cmd == "heap") {
             heap_print(cpu);
         } else if (cmd == "alloc") {
@@ -732,5 +652,6 @@ int main() {
         }
     }
 
-    return 0; // 0 means "success" to the operating system
+    stack_clear(cpu.stack); // the list build gives its nodes back
+    return 0;               // 0 means "success" to the operating system
 }

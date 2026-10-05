@@ -23,6 +23,7 @@ enum class Op : std::uint8_t {
     Inc = 0x18,
     Dec = 0x19,
     Cmp = 0x1A, // A - B for the flags only; A is kept (Lab 4)
+    Mul = 0x1B, // A = A * B, low 8 bits; C = the product did not fit (Lab 7)
     // 0x2_ — data movement (Lab 3 rows; HLOW is *opt*, Lab 4, done early)
     LoadiA = 0x20,
     LoadiB = 0x21,
@@ -49,6 +50,15 @@ enum class Op : std::uint8_t {
     Plot = 0x41,
     Unplot = 0x42,
     Show = 0x43,
+    // 0x5_ — stack and calls (Lab 7; PUSH H/POP H are *opt*)
+    PushA = 0x50,
+    PopA = 0x51,
+    PushB = 0x52,
+    PopB = 0x53,
+    Call = 0x54, // CALL addr16: push the return address (2 bytes), PC = addr
+    Ret = 0x55,  // pop 2 bytes into PC
+    PushH = 0x56,
+    PopH = 0x57,
     // 0x6_ — system (Lab 6)
     Alloc = 0x60, // H = a new block of A bytes on the guest heap; C = 1: it does not fit
     // 0x7_ — own extensions (ISA §8: 0x70-0xFF are free), Lab 4 and Lab 6

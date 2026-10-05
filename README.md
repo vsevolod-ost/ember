@@ -4641,3 +4641,1924 @@ int main() {
 | `0x72` | `FREE` | 1 | C | повернути в купу блок `[H, H + A)` (`A` — той самий розмір, що просили в `ALLOC`): верхній блок опускає вказівник купи, інший стає вузлом списку вільних блоків. Не блок купи, `A = 0`, уже вільний або менший за 3 байти не на вершині — виставити `C`, нічого не міняти | 6 |
 
 Номер — з вільного діапазону `0x70`–`0xFF` (ISA §8); `0x61`–`0x6F` і `0x73` і далі лишаються невідомими опкодами. Уточнення рядка `ALLOC`: успіх — `C = 0`; `A = 0` — `H = heap_ptr`, нічого не посувається; при непорожньому списку вільних блоків `ALLOC` спершу бере звідти (first fit: блок рівно на `A` байтів або хвіст блока, більшого щонайменше на 3), і тоді `heap_ptr` не посувається; зіпсований список — помилка кроку, нічого не змінено. `JG`/`JL` (`0x70`/`0x71`) — як у Lab 04; байт стану — `0xB02`, як у Lab 05.
+
+---
+
+# Lab 07 — Виклик і повернення: функції, стек і рекурсія
+
+Нові й змінені команди REPL:
+
+| Команда | Що робить |
+|---|---|
+| `regs` | тепер `PC A B H SP Z N C`; `SP` — чотири шістнадцяткові цифри, як `PC` і `H` |
+| `stack [n]` | стек гостя: `SP`, скільки байтів зайнято й вільно, найглибший `SP` (від старту або від останнього `reg sp`), далі до `n` (1..256, за замовчуванням 8) найновіших байтів — від вершини вниз |
+| `trace <on\|off\|calls>` | новий режим `calls`: `run` друкує рядок трасування лише для кроків `CALL` і `RET` |
+| `reg sp <v>` | поставити `SP`, `v` від `0x0eff` до `0x0fff`; байти над новим `SP` відтепер вважаються стеком |
+| `alu mul <a> <b>` | `MUL` без програми: результат і прапорці |
+
+У рядку трасування, як і в `regs`, після `H` з'явилась колонка `SP=0x....`. Коли стек не порожній, у кінці рядка стоїть `top: hh hh` — два найновіші байти стека, найновіший перший: після `CALL` з адреси `0x0002` це `top: 00 05`, тобто адреса повернення `0x0005`. Нові мнемоніки — `MUL A, B`, `PUSH A`/`B`/`H`, `POP A`/`B`/`H`, `CALL 0x....`, `RET`. Нові помилки кроку — `stack overflow: …` і `stack underflow: …`; обидві закінчуються на `nothing done`, як і решта. Транскрипти Lab 02–06 вище знято до появи колонки `SP`. Інших відмінностей у виводі немає, це перевіряє M4.
+
+## M1 — `SP`, `PUSH`/`POP` і `Stack` як тип
+
+Стек — це 256 байтів пам'яті гостя `0xF00`–`0xFFF` плюс `SP`. Усе, що про нього знає решта `ember` (`cpu.cpp`, `main.cpp`, `messages.cpp`), — функції з `src/stack.hpp`:
+
+```cpp
+struct CPU;
+struct StackNode; // opaque: defined only in stack_list.cpp
+
+// 256 bytes: SP is STACK_HI when empty and STACK_LO - 1 (0xEFF) when full.
+// Only stack*.cpp look inside (layout.cpp only asks offsetof).
+struct Stack {
+    std::uint16_t sp = static_cast<std::uint16_t>(STACK_HI);  // the next free byte
+    std::uint16_t low = static_cast<std::uint16_t>(STACK_HI); // the deepest SP so far
+    StackNode* top = nullptr; // the newest node (list build); always nullptr in the array build
+};
+
+// Every refusal is false with nothing changed: not a byte, not SP.
+
+// PUSH: put `v` at SP, SP -= 1. False: full (the byte would go below STACK_LO).
+bool push(CPU& cpu, Byte v);
+// POP: SP += 1, `out` = that byte. False: empty (SP is STACK_HI).
+bool pop(CPU& cpu, Byte& out);
+// CALL/PUSH H: two bytes, low first, then high (ISA §6). False: fewer than 2 free.
+bool push16(CPU& cpu, std::uint16_t v);
+// RET/POP H: high byte first, then low. False: fewer than 2 bytes on the stack.
+bool pop16(CPU& cpu, std::uint16_t& out);
+// What pop16 would give, without taking it (RET checks its target first).
+bool peek16(const CPU& cpu, std::uint16_t& out);
+// The i-th byte from the top (0 = the newest). False: fewer than i + 1 bytes.
+bool stack_peek(const CPU& cpu, std::size_t i, Byte& out);
+
+bool stack_empty(const Stack& s);
+bool stack_full(const Stack& s);
+std::size_t stack_used(const Stack& s); // bytes on the stack, 0..256
+std::size_t stack_free(const Stack& s); // bytes a push can still take, 0..256
+std::uint16_t stack_sp(const Stack& s);
+std::uint16_t stack_deepest(const Stack& s); // the lowest SP since start or `reg sp`
+
+// `reg sp`: SP = sp (STACK_LO - 1 .. STACK_HI); the bytes above it are the
+// stack from now on. The deepest mark starts again here. False: out of range.
+bool stack_set_sp(CPU& cpu, std::uint16_t sp);
+
+// `stack [n]`: SP, used/free, the deepest SP, then the n newest bytes.
+void stack_print(const CPU& cpu, std::size_t n);
+
+// Empty the stack and give back any host memory it holds (the nodes of the
+// list build). main calls it once, before the CPU goes away.
+void stack_clear(Stack& s);
+```
+
+Теорія показує `Stack` із власним масивом `uint16_t data[64]` — це стек хоста. В ISA стек — байти пам'яті гостя (`PUSH A` — це `mem[SP] = A`), тому значення тут `Byte`, а 16-бітна адреса повернення кладеться двома байтами через `push16`/`pop16`. `push` і `pop` повертають `bool`: `false` означає, що нічого не змінено.
+
+Межі стека:
+
+- **порожній** — `SP = 0xFFF`: наступний вільний байт найвищий, знімати нічого;
+- **повний** — `SP = 0xEFF`: зайняті всі 256 байтів, останній — `0xF00`;
+- **переповнення** — `PUSH`, `CALL` чи `PUSH H`, чий байт ліг би нижче за `0xF00` (`SP < 0xF00` перед записом);
+- **спустошення** — `POP`, `RET` чи `POP H`, які мали б читати вище за `0xFFF` (`SP >= 0xFFF`; для двобайтових — менше двох байтів на стеку).
+
+Обидві помилки поводяться як усі помилки кроку в `ember`: перевірка стоїть до будь-якої зміни, тож не змінено нічого (ні байтів, ні `SP`, ні `PC`), а `run` зупиняється. `CALL` і `PUSH H` спершу перевіряють, що є місце під обидва байти, тому половина адреси на стеку ніколи не лишається.
+
+DEFENSE T1, байти `20 07 50 20 09 50 53 00`:
+
+```txt
+адр.  байти        текст
+0000  20 07        LOADI A, 7
+0002  50           PUSH  A                   ; mem[0xFFF] = 7
+0003  20 09        LOADI A, 9
+0005  50           PUSH  A                   ; mem[0xFFE] = 9
+0006  53           POP   B                   ; B = 9, SP = 0xFFE
+0007  00           HALT
+```
+
+```txt
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember> set 0 0x20
+ember> set 1 0x07
+ember> set 2 0x50
+ember> set 3 0x20
+ember> set 4 0x09
+ember> set 5 0x50
+ember> set 6 0x53
+ember> set 7 0x00
+ember> trace on
+ember> run
+0000  20 07     LOADI A, 0x07     -> A=  7  B=  0  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+0002  50        PUSH A            -> A=  7  B=  0  H=0x0000  SP=0x0ffe  Z=0 N=0 C=0  top: 07
+0003  20 09     LOADI A, 0x09     -> A=  9  B=  0  H=0x0000  SP=0x0ffe  Z=0 N=0 C=0  top: 07
+0005  50        PUSH A            -> A=  9  B=  0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0  top: 09 07
+0006  53        POP B             -> A=  9  B=  9  H=0x0000  SP=0x0ffe  Z=0 N=0 C=0  top: 07
+0007  00        HALT              -> A=  9  B=  9  H=0x0000  SP=0x0ffe  Z=0 N=0 C=0  top: 07
+halted after 6 steps
+ember> regs
+PC=0x0008  A=9  B=9  H=0x0000  SP=0x0ffe  Z=0 N=0 C=0
+ember> stack
+SP=0x0ffe  1 byte on the stack, 255 free (stack 0x0f00-0x0fff); deepest SP=0x0ffd (2 bytes)
+  0x0fff  07  <- top
+ember> get 4095
+7  0x07  0b00000111  '.'
+ember> get 4094
+9  0x09  0b00001001  '.'
+ember> dump 0xFF0 16
+0ff0  00 00 00 00 00 00 00 00 00 00 00 00 00 00 09 07  |................|
+ember>
+```
+
+`B = 9`, `SP = 0x0ffe`, `mem[0xFFF] = 7`, `mem[0xFFE] = 9`. `POP` не стер дев'ятку, а лише посунув `SP`, тож тепер це вільне місце. Тому `stack` показує один живий байт, а `dump` — обидва.
+
+Спустошення: `POP A`, а потім `RET` на порожньому стеку. `RET` без `CALL` не стрибає «в нікуди», а відмовляє:
+
+```txt
+ember> set 0 0x51
+ember> run
+stack underflow: POP A at 0x0000 needs 1 byte, 0 on the stack (SP=0x0fff); nothing done
+stopped after 0 steps
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember> set 0 0x55
+ember> run
+stack underflow: RET at 0x0000 needs 2 bytes, 0 on the stack (SP=0x0fff); nothing done
+stopped after 0 steps
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember> stack
+SP=0x0fff  empty, 256 free (stack 0x0f00-0x0fff); deepest SP=0x0fff (0 bytes)
+ember>
+```
+
+Переповнення: `PUSH A` на повному стеку, а потім `CALL`, якому з двох потрібних байтів лишився один:
+
+```txt
+ember> reg sp 0xEFF
+ember> stack 2
+SP=0x0eff  256 bytes on the stack, 0 free (stack 0x0f00-0x0fff); deepest SP=0x0eff (256 bytes)
+  0x0f00  00  <- top
+  0x0f01  00
+  ... 254 bytes more, up to 0x0fff
+ember> set 0 0x50
+ember> step
+stack overflow: PUSH A at 0x0000 needs 1 byte, 0 free (SP=0x0eff, stack 0x0f00-0x0fff); nothing done
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  SP=0x0eff  Z=0 N=0 C=0
+ember> reg sp 0xF00
+ember> set 0 0x54
+ember> set16 1 0x0010
+ember> step
+stack overflow: CALL 0x0010 at 0x0000 needs 2 bytes, 1 free (SP=0x0f00, stack 0x0f00-0x0fff); nothing done
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  SP=0x0f00  Z=0 N=0 C=0
+ember> stack 2
+SP=0x0f00  255 bytes on the stack, 1 free (stack 0x0f00-0x0fff); deepest SP=0x0f00 (255 bytes)
+  0x0f01  00  <- top
+  0x0f02  00
+  ... 253 bytes more, up to 0x0fff
+ember>
+```
+
+## M2 — `CALL` / `RET`
+
+Псевдокод ISA §6 (дано):
+
+```txt
+CALL addr16 стоїть за адресою P (тобто займає P, P+1, P+2):
+
+    ret  = P + 3                 ; адреса ПІСЛЯ CALL, а не сам P
+    mem[SP] = ret & 0x00FF       ; молодший байт
+    SP      = SP - 1
+    mem[SP] = ret >> 8           ; старший байт
+    SP      = SP - 1
+    PC      = addr16
+
+RET:
+
+    SP = SP + 1 ;  hi = mem[SP]  ; старший байт знімається першим
+    SP = SP + 1 ;  lo = mem[SP]
+    PC = (hi << 8) | lo
+```
+
+У `cpu.cpp` записано лише, що робить інструкція. Порядок байтів живе в `push16`/`pop16` (`stack.cpp`), спільних для `CALL`, `RET`, `PUSH H` і `POP H`:
+
+```cpp
+        case Op::Call:
+            // ISA §6: the return address is P + 3, the instruction AFTER this
+            // CALL (`next`, before the jump changes it), low byte first. A
+            // target outside the box is refused before the stack is touched.
+            ret = next;
+            if (!jump_to(w16, next))
+                return StepResult::bad_address;
+            if (!push16(cpu, ret))
+                return StepResult::stack_overflow;
+            break;
+
+        case Op::Ret:
+            // Look first, take after: an address outside the box is refused
+            // with SP where it was.
+            if (!peek16(cpu, ret))
+                return StepResult::stack_underflow;
+            if (!jump_to(ret, next))
+                return StepResult::bad_address;
+            pop16(cpu, ret);
+            break;
+```
+
+```cpp
+// Both bytes or none: the room for two is checked before the first push, so
+// a CALL never leaves half an address behind.
+bool push16(CPU& cpu, std::uint16_t v) {
+    if (stack_free(cpu.stack) < 2)
+        return false;
+    if (!push(cpu, static_cast<Byte>(v & 0xFF))) // low byte first
+        return false;
+    if (!push(cpu, static_cast<Byte>(v >> 8))) {
+        // Only a list without a node for the second byte gets here: take the
+        // first one back. (A leftover mirror byte lies below SP: free space.)
+        Byte undo = 0;
+        pop(cpu, undo);
+        return false;
+    }
+    return true;
+}
+
+bool peek16(const CPU& cpu, std::uint16_t& out) {
+    if (stack_used(cpu.stack) < 2)
+        return false;
+    // The newest byte (the high one, pushed last) is popped first.
+    out = static_cast<std::uint16_t>((store_peek(cpu, 0) << 8) | store_peek(cpu, 1));
+    return true;
+}
+
+bool pop16(CPU& cpu, std::uint16_t& out) {
+    if (stack_used(cpu.stack) < 2)
+        return false;
+    Byte hi = 0, lo = 0;
+    pop(cpu, hi); // high byte first
+    pop(cpu, lo);
+    out = static_cast<std::uint16_t>((hi << 8) | lo);
+    return true;
+}
+```
+
+`RET` спершу лише дивиться на адресу (`peek16`) і перевіряє її, а знімає вже потім. Так помилка лишає `SP` на місці.
+
+Програма M2:
+
+```txt
+адр.  байти        текст
+0000  54 04 00              CALL  printA
+0003  00                    HALT
+0004  02           printA:  OUT
+0005  55                    RET
+```
+
+```txt
+ember> set 0 0x54
+ember> set 1 0x04
+ember> set 2 0x00
+ember> set 3 0x00
+ember> set 4 0x02
+ember> set 5 0x55
+ember> reg a 65
+ember> trace on
+ember> run
+0000  54 04 00  CALL 0x0004       -> A= 65  B=  0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0  top: 00 03
+A
+0004  02        OUT               -> A= 65  B=  0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0  top: 00 03
+0005  55        RET               -> A= 65  B=  0  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+0003  00        HALT              -> A= 65  B=  0  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+halted after 4 steps
+ember> stack
+SP=0x0fff  empty, 256 free (stack 0x0f00-0x0fff); deepest SP=0x0ffd (2 bytes)
+ember> get 4095
+3  0x03  0b00000011  '.'
+ember> get 4094
+0  0x00  0b00000000  '.'
+ember>
+```
+
+По рядках: `CALL` поклав `0x0003` (адресу `HALT`) і перейшов на `0x0004`, `SP` опустився на 2 (`0x0ffd`), вершина — `00 03`. `OUT` надрукував `A`. `RET` зняв два байти: `SP` знову `0x0fff`, `PC = 0x0003`. Байти лишились у пам'яті: молодший `0x03` поклали першим, і він лежить вище (`0xFFF`); старший `0x00` — під ним (`0xFFE`). Знімаються вони у зворотному порядку: спершу старший, потім молодший.
+
+Той самий порядок там, де старший байт не нуль. `CALL` стоїть на `0x07FD`, тож адреса повернення — `0x0800` (DEFENSE T2):
+
+```txt
+ember> reg pc 0x07FD
+ember> set 0x7FD 0x54
+ember> set16 0x7FE 0x0010
+ember> step
+07fd  54 10 00  CALL 0x0010       -> A=  0  B=  0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0  top: 08 00
+ember> regs
+PC=0x0010  A=0  B=0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0
+ember> get 4095
+0  0x00  0b00000000  '.'
+ember> get 4094
+8  0x08  0b00001000  '.'
+ember> stack 2
+SP=0x0ffd  2 bytes on the stack, 254 free (stack 0x0f00-0x0fff); deepest SP=0x0ffd (2 bytes)
+  0x0ffe  08  <- top
+  0x0fff  00
+ember>
+```
+
+**Чому `PC + 3`, а не адреса самого `CALL`.** `RET` нічого не знає про інструкцію, яка викликала функцію: він просто ставить `PC` на зняту адресу. Якби на стеку лежала адреса самого `CALL`, після повернення той самий `CALL` виконався б знову, знову поклав би себе на стек і знову стрибнув у функцію — програма ніколи не пішла б далі цього виклику. Повертатися треба на **наступну** інструкцію, а `CALL` займає три байти (опкод і 16-бітна адреса), тож це `P + 3`. У `step` це `next = ins.at + ins.size`, порахована ще до того, як стрибок її перезапише.
+
+## M3 — `MUL` і рекурсивний `fact`
+
+`MUL A, B` (`0x1B`) — одна функція в ALU:
+
+```cpp
+// The core is one line: a and b become int (255 * 255 = 65025 fits, no
+// overflow), the product is exact, and the cast keeps the low 8 bits. Not
+// bit by bit like alu_add: a multiplier is shifts and adds, and Lab 7's
+// Advanced builds one from ADD as a guest subroutine.
+Byte alu_mul(Byte a, Byte b, Flags& f) {
+    const unsigned p = static_cast<unsigned>(a * b);
+    const Byte r = static_cast<Byte>(p);
+    f.c = p > 0xFF;
+    set_zn(r, f);
+    return r;
+}
+```
+
+```txt
+ember> alu mul 5 24
+result=120  Z=0 N=0 C=0
+ember> alu mul 120 6
+result=208  Z=0 N=1 C=1
+ember> alu mul 16 16
+result=0  Z=1 N=0 C=1
+ember> alu mul 0 200
+result=0  Z=1 N=0 C=0
+ember>
+```
+
+Даний лістинг (ISA §6, дослівно):
+
+```txt
+адр.  байти        текст
+0000  20 05        LOADI A, 5        ; n = 5
+0002  54 07 00     CALL  fact
+0005  03           OUTN              ; надрукує 120
+0006  00           HALT
+
+; fact(n): аргумент в A, результат в A. Псує B.
+0007  21 00        fact:  LOADI B, 0
+0009  1A                  CMP   A, B       ; n == 0 ?
+000A  31 1B 00            JZ    base
+000D  21 01               LOADI B, 1
+000F  1A                  CMP   A, B       ; n == 1 ?
+0010  31 1B 00            JZ    base
+0013  50                  PUSH  A          ; зберегти n — виклик знищить A
+0014  19                  DEC   A
+0015  54 07 00            CALL  fact       ; A = fact(n-1)
+0018  53                  POP   B          ; B = збережене n
+0019  1B                  MUL   A, B       ; A = fact(n-1) * n
+001A  55                  RET
+001B  20 01        base:  LOADI A, 1
+001D  55                  RET
+```
+
+Ті самі 30 байтів — у `checks/lab-07.txt`:
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x05
+ember> set 2 0x54
+ember> set 3 0x07
+ember> set 4 0x00
+ember> set 5 0x03
+ember> set 6 0x00
+ember> set 7 0x21
+ember> set 8 0x00
+ember> set 9 0x1A
+ember> set 10 0x31
+ember> set 11 0x1B
+ember> set 12 0x00
+ember> set 13 0x21
+ember> set 14 0x01
+ember> set 15 0x1A
+ember> set 16 0x31
+ember> set 17 0x1B
+ember> set 18 0x00
+ember> set 19 0x50
+ember> set 20 0x19
+ember> set 21 0x54
+ember> set 22 0x07
+ember> set 23 0x00
+ember> set 24 0x53
+ember> set 25 0x1B
+ember> set 26 0x55
+ember> set 27 0x20
+ember> set 28 0x01
+ember> set 29 0x55
+ember> run
+120 
+halted after 60 steps
+ember> regs
+PC=0x0007  A=120  B=5  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember> stack
+SP=0x0fff  empty, 256 free (stack 0x0f00-0x0fff); deepest SP=0x0ff1 (14 bytes)
+ember> quit
+```
+
+`fact(5)` друкує `120` за 60 кроків, і `SP` повертається в `0x0fff`.
+
+`fact(0)` і `fact(1)`: перша пара `20 05` стає `20 00` або `20 01` (`set 1 n`). У цьому й наступних транскриптах із `fact` вирізано 30 рядків `set` на початку — це ті самі рядки, що в `checks/lab-07.txt` вище, і вони нічого не друкують (`build.py` це перевіряє):
+
+```txt
+ember> set 1 0
+ember> run
+1 
+halted after 9 steps
+ember> regs
+PC=0x0007  A=1  B=0  H=0x0000  SP=0x0fff  Z=1 N=0 C=0
+ember>
+```
+
+```txt
+ember> set 1 1
+ember> run
+1 
+halted after 12 steps
+ember> regs
+PC=0x0007  A=1  B=1  H=0x0000  SP=0x0fff  Z=1 N=0 C=0
+ember>
+```
+
+Кроки: головна програма — 4 інструкції (`LOADI`, `CALL`, `OUTN`, `HALT`). `fact(0)` виходить на `base` після першого `JZ` — 5 інструкцій, разом 9. `fact(1)` — після другого, 8 інструкцій, разом 12. Кожен рівень, що рекурсує, додає 12: шість інструкцій перевірок, `PUSH A`, `DEC A`, `CALL`, `POP B`, `MUL`, `RET`. Звідси 12n при n ≥ 1.
+
+По рядку на кожен `CALL` і `RET`, у рядку `SP` і `A` (`trace calls`):
+
+```txt
+ember> trace calls
+ember> run
+0002  54 07 00  CALL 0x0007       -> A=  5  B=  0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0  top: 00 05
+0015  54 07 00  CALL 0x0007       -> A=  4  B=  1  H=0x0000  SP=0x0ffa  Z=0 N=0 C=0  top: 00 18
+0015  54 07 00  CALL 0x0007       -> A=  3  B=  1  H=0x0000  SP=0x0ff7  Z=0 N=0 C=0  top: 00 18
+0015  54 07 00  CALL 0x0007       -> A=  2  B=  1  H=0x0000  SP=0x0ff4  Z=0 N=0 C=0  top: 00 18
+0015  54 07 00  CALL 0x0007       -> A=  1  B=  1  H=0x0000  SP=0x0ff1  Z=0 N=0 C=0  top: 00 18
+001d  55        RET               -> A=  1  B=  1  H=0x0000  SP=0x0ff3  Z=1 N=0 C=0  top: 02 00
+001a  55        RET               -> A=  2  B=  2  H=0x0000  SP=0x0ff6  Z=0 N=0 C=0  top: 03 00
+001a  55        RET               -> A=  6  B=  3  H=0x0000  SP=0x0ff9  Z=0 N=0 C=0  top: 04 00
+001a  55        RET               -> A= 24  B=  4  H=0x0000  SP=0x0ffc  Z=0 N=0 C=0  top: 05 00
+001a  55        RET               -> A=120  B=  5  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+120 
+halted after 60 steps
+ember> stack
+SP=0x0fff  empty, 256 free (stack 0x0f00-0x0fff); deepest SP=0x0ff1 (14 bytes)
+ember>
+```
+
+**Глибина.** Найнижчий `SP` — `0x0ff1`, тобто 14 байтів. Два з них — адреса повернення в головну програму (`CALL` з `0x0002`). Ще 12 — чотири рівні по 3 байти: `fact(5)`, `fact(4)`, `fact(3)` і `fact(2)` кладуть кожен своє `n` (`PUSH A`) і адресу повернення `0x0018` (`CALL` з `0x0015`). `fact(1)` іде на `base` ще до `PUSH A` і власних байтів не кладе. Дорогою назад між сусідніми `RET` `SP` росте на 3: `POP B` знімає `n`, `RET` — два байти адреси. Вершина після `RET` — `n` рівня, у який повернулись (його зараз зніме `POP B`), і старший байт адреси, за якою повернеться вже цей рівень (`top: 02 00`, `03 00`…).
+
+### Три зміни
+
+**1. Друк `n` на вході й на виході, як `fact` з notes §2.** Символи `>`, `<`, цифра (`'0' + n`, бо n ≤ 9) і `'\n'` друкує `OUT`, результат — `OUTN`. На час друку `n` лежить на стеку (`PUSH A`/`POP A`). `B` псується — за конвенцією його зберігає той, хто викликає:
+
+```txt
+адр.  байти        текст
+0000  20 03                 LOADI A, 3       ; n = 3
+0002  54 07 00              CALL  fact
+0005  03                    OUTN             ; надрукує 6
+0006  00                    HALT
+
+; fact(n): друкує >n на вході і <n на виході, як fact у notes §2.
+0007  50           fact:    PUSH  A          ; n — друк знищить A
+0008  20 3E                 LOADI A, 62      ; '>'
+000A  02                    OUT
+000B  51                    POP   A          ; n
+000C  50                    PUSH  A
+000D  21 30                 LOADI B, 48      ; '0'
+000F  10                    ADD   A, B       ; A = '0' + n
+0010  02                    OUT
+0011  20 0A                 LOADI A, 10      ; '\n'
+0013  02                    OUT
+0014  51                    POP   A          ; n
+0015  21 00                 LOADI B, 0
+0017  1A                    CMP   A, B       ; n == 0 ?
+0018  31 37 00              JZ    base
+001B  21 01                 LOADI B, 1
+001D  1A                    CMP   A, B       ; n == 1 ?
+001E  31 37 00              JZ    base
+0021  50                    PUSH  A          ; зберегти n
+0022  19                    DEC   A
+0023  54 07 00              CALL  fact       ; A = fact(n-1)
+0026  53                    POP   B          ; B = n
+0027  1B                    MUL   A, B       ; A = fact(n-1) * n
+0028  50                    PUSH  A          ; результат
+0029  52                    PUSH  B          ; n
+002A  20 3C                 LOADI A, 60      ; '<'
+002C  02                    OUT
+002D  51                    POP   A          ; n
+002E  21 30                 LOADI B, 48      ; '0'
+0030  10                    ADD   A, B       ; A = '0' + n
+0031  02                    OUT
+0032  20 0A                 LOADI A, 10      ; '\n'
+0034  02                    OUT
+0035  51                    POP   A          ; результат
+0036  55                    RET
+0037  20 01        base:    LOADI A, 1
+0039  55                    RET
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x03
+ember> set 2 0x54
+ember> set 3 0x07
+ember> set 4 0x00
+ember> set 5 0x03
+ember> set 6 0x00
+ember> set 7 0x50
+ember> set 8 0x20
+ember> set 9 0x3E
+ember> set 10 0x02
+ember> set 11 0x51
+ember> set 12 0x50
+ember> set 13 0x21
+ember> set 14 0x30
+ember> set 15 0x10
+ember> set 16 0x02
+ember> set 17 0x20
+ember> set 18 0x0A
+ember> set 19 0x02
+ember> set 20 0x51
+ember> set 21 0x21
+ember> set 22 0x00
+ember> set 23 0x1A
+ember> set 24 0x31
+ember> set 25 0x37
+ember> set 26 0x00
+ember> set 27 0x21
+ember> set 28 0x01
+ember> set 29 0x1A
+ember> set 30 0x31
+ember> set 31 0x37
+ember> set 32 0x00
+ember> set 33 0x50
+ember> set 34 0x19
+ember> set 35 0x54
+ember> set 36 0x07
+ember> set 37 0x00
+ember> set 38 0x53
+ember> set 39 0x1B
+ember> set 40 0x50
+ember> set 41 0x52
+ember> set 42 0x20
+ember> set 43 0x3C
+ember> set 44 0x02
+ember> set 45 0x51
+ember> set 46 0x21
+ember> set 47 0x30
+ember> set 48 0x10
+ember> set 49 0x02
+ember> set 50 0x20
+ember> set 51 0x0A
+ember> set 52 0x02
+ember> set 53 0x51
+ember> set 54 0x55
+ember> set 55 0x20
+ember> set 56 0x01
+ember> set 57 0x55
+ember> run
+>3
+>2
+>1
+<2
+<3
+6 
+halted after 91 steps
+ember> regs
+PC=0x0007  A=6  B=48  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember>
+```
+
+`fact` з notes §2 на C++ (GCC 16, рядок збірки з Notes 01):
+
+```cpp
+#include <iostream>
+int fact(int n) {
+    std::cout << '>' << n << '\n';
+    if (n <= 1) return 1;
+    int r = n * fact(n - 1);
+    std::cout << '<' << n << '\n';
+    return r;
+}
+int main() { std::cout << fact(3) << '\n'; }
+```
+
+```txt
+$ c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined n2.cpp -o scratch && ./scratch
+>3
+>2
+>1
+<2
+<3
+6
+[exit 0]
+```
+
+Порівняння, обидва виводи знято зараз (скрипт `io-diff.sh`):
+
+```txt
+$ diff cpp.txt ember.txt
+6c6
+< 6
+---
+> 6 
+[diff exit 1]
+$ diff <(sed "s/ *$//" cpp.txt) <(sed "s/ *$//" ember.txt)   # без пробілу в кінці рядка
+[diff exit 0]
+```
+
+Рядки `>3 >2 >1 <2 <3` збігаються байт у байт. Єдина різниця — пробіл після `6`: так за ISA друкує `OUTN` («десяткове число і пробіл»). `<1` немає ні там, ні там, бо `fact(1)` повертається з бази раніше, ніж доходить до друку `<`.
+
+**2. Без пари `PUSH A` / `POP B`.** Обидва байти стають `NOP` (`01`), тож адреси не зсуваються:
+
+```txt
+ember> set 19 1
+ember> set 24 1
+ember> dump 0x10 16
+0010  31 1b 00 01 19 54 07 00 01 1b 55 20 01 55 00 00  |1....T....U .U..|
+ember> trace calls
+ember> run
+0002  54 07 00  CALL 0x0007       -> A=  5  B=  0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0  top: 00 05
+0015  54 07 00  CALL 0x0007       -> A=  4  B=  1  H=0x0000  SP=0x0ffb  Z=0 N=0 C=0  top: 00 18
+0015  54 07 00  CALL 0x0007       -> A=  3  B=  1  H=0x0000  SP=0x0ff9  Z=0 N=0 C=0  top: 00 18
+0015  54 07 00  CALL 0x0007       -> A=  2  B=  1  H=0x0000  SP=0x0ff7  Z=0 N=0 C=0  top: 00 18
+0015  54 07 00  CALL 0x0007       -> A=  1  B=  1  H=0x0000  SP=0x0ff5  Z=0 N=0 C=0  top: 00 18
+001d  55        RET               -> A=  1  B=  1  H=0x0000  SP=0x0ff7  Z=1 N=0 C=0  top: 00 18
+001a  55        RET               -> A=  1  B=  1  H=0x0000  SP=0x0ff9  Z=0 N=0 C=0  top: 00 18
+001a  55        RET               -> A=  1  B=  1  H=0x0000  SP=0x0ffb  Z=0 N=0 C=0  top: 00 18
+001a  55        RET               -> A=  1  B=  1  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0  top: 00 05
+001a  55        RET               -> A=  1  B=  1  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+1 
+halted after 60 steps
+ember> regs
+PC=0x0007  A=1  B=1  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember>
+```
+
+Друкує `1` за ті самі 60 кроків. Без `POP B` у `B` після повернення лежить те, що лишив викликаний `fact`: кожен виклик із n ≥ 1 робить `LOADI B, 1` для перевірки «n == 1?», і найглибший `fact(1)` виходить на `base` саме з `B = 1`. Тому кожен `MUL` множить на 1, і `1` з бази так і доходить до головної програми. Кожен рівень тепер кладе лише 2 байти: `SP` у трасі йде кроками по 2, а не по 3.
+
+**3. `fact(6)`:**
+
+```txt
+ember> set 1 6
+ember> run
+208 
+halted after 72 steps
+ember> regs
+PC=0x0007  A=208  B=6  H=0x0000  SP=0x0fff  Z=0 N=1 C=1
+ember> alu mul 120 6
+result=208  Z=0 N=1 C=1
+ember>
+```
+
+`208`, 72 кроки, `C = 1`. Справжній добуток 720 = 2·256 + 208 у байт не влазить: `MUL` залишив молодші 8 бітів (208) і виставив `C`. Прапорець виставив останній `MUL` (120·6), а `RET`, `OUTN` і `HALT` прапорців не чіпають — тому `regs` після `HALT` ще показує `C=1`. Для `fact(5)` останній `MUL` — 24·5 = 120, і там `C=0`.
+
+### Навмисне переповнення
+
+**(а) Без базового випадку.** Обидва `JZ base` (`31 1B 00`) стають трьома `NOP`, адреси не зсуваються:
+
+```txt
+ember> set 10 1
+ember> set 11 1
+ember> set 12 1
+ember> set 16 1
+ember> set 17 1
+ember> set 18 1
+ember> run
+stack overflow: CALL 0x0007 at 0x0015 needs 2 bytes, 1 free (SP=0x0f00, stack 0x0f00-0x0fff); nothing done
+stopped after 1106 steps
+ember> regs
+PC=0x0015  A=176  B=1  H=0x0000  SP=0x0f00  Z=0 N=1 C=0
+ember> stack 4
+SP=0x0f00  255 bytes on the stack, 1 free (stack 0x0f00-0x0fff); deepest SP=0x0f00 (255 bytes)
+  0x0f01  b1  <- top
+  0x0f02  00
+  0x0f03  18
+  0x0f04  b2
+  ... 251 bytes more, up to 0x0fff
+ember>
+```
+
+Без бази `n` іде 5, 4, …, 0, 255, 254, … і ніколи не закінчується, а кожен рівень кладе 3 байти. Після `CALL` з головної програми і 84 повних рівнів зайнято 2 + 84·3 = 254 байти. 85-й рівень кладе своє `n` (255-й байт), і його `CALL` потребує двох байтів там, де лишився один. Кроків 2 + 84·13 + 12 = 1106: на рівень — 13 інструкцій, бо з шести `NOP`-ів жоден не стрибає. Машина зупинилась нашою помилкою, процес живий. DEFENSE для еталона називає 1107 кроків і `SP = 0xEFF`: там `CALL` встигає покласти молодший байт і падає на старшому. У нас `CALL` перевіряє місце під обидва байти заздалегідь і нічого не кладе, тож відмовлений крок не зараховано, а `SP` лишився `0x0f00`.
+
+**(б) Мало місця.** Регіон не змінюється (він константа `STACK_LO`), але `reg sp 0xF05` ставить `SP` на 250 байтів нижче старту, тож вільних лишається 6. Верхні 250 байтів (нулі) відтепер рахуються як зайняті. `fact(5)` потрібно 14:
+
+```txt
+ember> reg sp 0xF05
+ember> stack 1
+SP=0x0f05  250 bytes on the stack, 6 free (stack 0x0f00-0x0fff); deepest SP=0x0f05 (250 bytes)
+  0x0f06  00  <- top
+  ... 249 bytes more, up to 0x0fff
+ember> run
+stack overflow: CALL 0x0007 at 0x0015 needs 2 bytes, 0 free (SP=0x0eff, stack 0x0f00-0x0fff); nothing done
+stopped after 19 steps
+ember> regs
+PC=0x0015  A=3  B=1  H=0x0000  SP=0x0eff  Z=0 N=0 C=0
+ember> stack 4
+SP=0x0eff  256 bytes on the stack, 0 free (stack 0x0f00-0x0fff); deepest SP=0x0eff (256 bytes)
+  0x0f00  04  <- top
+  0x0f01  00
+  0x0f02  18
+  0x0f03  05
+  ... 252 bytes more, up to 0x0fff
+ember>
+```
+
+Шість байтів — це головний `CALL` (2), `fact(5)` (3) і `PUSH A` у `fact(4)`. Його `CALL` місця вже не має.
+
+## M4 — розділений бінарник
+
+| Файл | За що відповідає |
+|---|---|
+| `main.cpp` | цикл REPL: прочитати рядок, розібрати команду, викликати потрібну функцію (дано; росте гілками `else if`) |
+| `messages.hpp/.cpp` | тексти про машину: чому крок відмовлено (`report`), чому купа сказала «ні», `help` (Лаба 7, винесено з `main.cpp`) |
+| `memory.hpp/.cpp` | коробка байтів і карта пам'яті; `mem_get`/`mem_set` — єдиний доступ до `Memory::data` (крім даних `dump()` і `show()`) |
+| `dump.hpp/.cpp` | дані `dump()` і `show_byte()` |
+| `hexdump.hpp/.cpp` | рядок дампу для `dump <addr> [n]` і `hostdump` |
+| `alu.hpp/.cpp` | 8-бітна арифметика й прапорці, тепер і `alu_mul` |
+| `opcodes.hpp` | `enum class Op` — номери з ISA |
+| `cpu.hpp/.cpp` | регістри, декодування, `step` (що робить кожна інструкція), рядок трасування, `guest_read`/`guest_write` |
+| `run.hpp/.cpp` | цикл `run`: ліміт кроків, точка зупинки, режим трасування |
+| `guest_io.hpp/.cpp` | вивід гостя (`OUT`, `OUTN`) |
+| `stack.hpp` | інтерфейс стека (Лаба 7) |
+| `stack.cpp` | правила ISA для стека: межі, рух `SP`, порядок байтів, команда `stack` |
+| `stack_store.hpp` | приватні гачки: як зберігаються байти стека |
+| `stack_array.cpp` / `stack_list.cpp` | байти стека в пам'яті гостя / у вузлах на хості; компілюється один із двох |
+| `heap.hpp/.cpp` | купа гостя, `ALLOC`/`FREE` (Лаба 6) |
+| `display.hpp/.cpp` | екран у відеопам'яті (Лаба 5) |
+| `search.hpp/.cpp` | `find` (Лаба 4) |
+| `sort.hpp/.cpp` | `sort` (Лаба 5) |
+| `sprite.hpp/.cpp` | спрайти хоста (Лаба 6) |
+| `value.hpp/.cpp` | тегований `Value` (Лаба 6) |
+| `layout.hpp/.cpp` | `layout` (Лаба 6) |
+
+```txt
+   103 src/alu.cpp
+   646 src/cpu.cpp
+    71 src/display.cpp
+    74 src/dump.cpp
+    25 src/guest_io.cpp
+   163 src/heap.cpp
+    49 src/hexdump.cpp
+   110 src/layout.cpp
+   657 src/main.cpp
+    41 src/memory.cpp
+   143 src/messages.cpp
+    27 src/run.cpp
+    22 src/search.cpp
+    91 src/sort.cpp
+    54 src/sprite.cpp
+   127 src/stack.cpp
+    21 src/stack_array.cpp
+    80 src/stack_list.cpp
+    82 src/value.cpp
+    23 src/alu.hpp
+   107 src/cpu.hpp
+    30 src/display.hpp
+    12 src/dump.hpp
+    18 src/guest_io.hpp
+    48 src/heap.hpp
+    16 src/hexdump.hpp
+    10 src/layout.hpp
+    44 src/memory.hpp
+    15 src/messages.hpp
+    68 src/opcodes.hpp
+    32 src/run.hpp
+    14 src/search.hpp
+    22 src/sort.hpp
+    30 src/sprite.hpp
+    62 src/stack.hpp
+    28 src/stack_store.hpp
+    32 src/value.hpp
+  3197 total
+```
+
+```cmake
+# Lab 7: how the guest stack keeps its bytes is chosen here, not in the
+# source. stack.hpp, stack.cpp and cpu.cpp are the same for both; only one
+# of the two files below is compiled in.
+#   cmake -S . -B build/list -DCMAKE_BUILD_TYPE=Debug -DEMBER_STACK=list
+set(EMBER_STACK "array" CACHE STRING "Representation of the guest stack: array or list")
+set_property(CACHE EMBER_STACK PROPERTY STRINGS array list)
+if(EMBER_STACK STREQUAL "array")
+    set(EMBER_STACK_SRC src/stack_array.cpp)
+elseif(EMBER_STACK STREQUAL "list")
+    set(EMBER_STACK_SRC src/stack_list.cpp)
+else()
+    message(FATAL_ERROR "EMBER_STACK is array or list, got '${EMBER_STACK}'")
+endif()
+
+add_executable(ember
+    src/main.cpp
+    src/memory.cpp
+    src/dump.cpp
+    src/alu.cpp
+    src/cpu.cpp
+    src/guest_io.cpp
+    src/hexdump.cpp
+    src/run.cpp
+    src/search.cpp
+    src/display.cpp
+    src/sort.cpp
+    src/heap.cpp
+    src/sprite.cpp
+    src/value.cpp
+    src/layout.cpp
+    src/stack.cpp
+    ${EMBER_STACK_SRC}
+    src/messages.cpp
+)
+```
+
+`main.cpp` — це лише цикл і розбір команд, логіки машини в ньому немає. Ланцюжок `else if` не розбиваю: це даний каркас курсу, який росте на одну гілку за команду. З нього в цій лабі пішли `report()`, `print_heap_refusal()` і `print_help()` (у `messages.cpp`, тексти без змін). Перевірка, що поведінка не змінилась: усі файли перевірок Lab 1–5 на збірці Lab 06 (`c0faa18`) і на поточній, з поточного виводу вирізано лише колонку `SP`:
+
+```sh
+#!/bin/sh
+# Lab 06 (c0faa18) against the working tree: every check file of Labs 1-5.
+# The only expected difference is the new SP column, so it is cut out of the
+# new output (sed) before the comparison.
+old=$(mktemp -d)
+git archive c0faa18 src CMakeLists.txt | tar -x -C "$old"
+cmake -S "$old" -B "$old/build" -DCMAKE_BUILD_TYPE=Debug > /dev/null
+cmake --build "$old/build" > /dev/null
+for f in docs/checks/lab-01.txt notes-local/lab-0[2-5]/upstream/checks/lab-0?.txt; do
+    "$old/build/ember" < "$f" > "$old/a.out" 2> "$old/a.err"; ea=$?
+    ./build/ember < "$f" > "$old/b.raw" 2> "$old/b.err"; eb=$?
+    sed 's/  SP=0x0fff//' "$old/b.raw" > "$old/b.out"
+    n=$(grep -c 'SP=0x0fff' "$old/b.raw")
+    if cmp -s "$old/a.out" "$old/b.out" && [ ! -s "$old/a.err" ] && [ ! -s "$old/b.err" ] &&
+       [ $ea -eq 0 ] && [ $eb -eq 0 ]; then
+        echo "$(basename "$f"): identical without SP ($n lines had it), exit 0, stderr empty"
+    else
+        echo "$(basename "$f"): DIFFERENT (exit $ea/$eb)"
+    fi
+done
+rm -rf "$old"
+```
+
+```txt
+lab-01.txt: identical without SP (0 lines had it), exit 0, stderr empty
+lab-02.txt: identical without SP (5 lines had it), exit 0, stderr empty
+lab-03.txt: identical without SP (1 lines had it), exit 0, stderr empty
+lab-04.txt: identical without SP (1 lines had it), exit 0, stderr empty
+lab-05.txt: identical without SP (0 lines had it), exit 0, stderr empty
+```
+
+**Чому `push` не в `cpu.cpp`.** `cpu.cpp` каже, **що** робить інструкція: «`PUSH A` — покласти `A`; не влізло — переповнення». **Як** стек тримає байти і де його межі — справа стека. Шари такі: `stack.hpp` (інтерфейс) → `stack.cpp` (правила ISA: межі, `SP -= 1`/`SP += 1`, найглибша позначка, молодший-потім-старший) → приватний `stack_store.hpp` (п'ять гачків) → `stack_array.cpp` **або** `stack_list.cpp` (де лежать байти). Тими самими функціями користуються `main.cpp` (`stack`, `reg sp`) і `messages.cpp`, тож правила про `SP` записані в одному місці й розійтись не можуть. Що це не лише слова, показує Advanced нижче: сховище стека замінене на зв'язаний список, а `cpu.cpp` не змінився ні на байт.
+
+## Конвенція виклику
+
+Процесор сам зберігає лише адресу повернення, усе інше — домовленість між тим, хто викликає, і функцією. Як я її розумію:
+
+1. Функція отримує аргумент у `A` і в `A` ж повертає результат, тож старе значення `A` після `CALL` пропадає.
+2. `B` і `H` функція має право зіпсувати. Якщо вони потрібні тому, хто викликає, після `CALL`, він сам кладе їх на стек до виклику і знімає після.
+3. Якщо функції самій треба щось зберегти — проміжне значення чи регістр, який вона обіцяє не чіпати, — вона кладе це на стек на вході й знімає перед `RET`. Кожен `PUSH` у функції має свій `POP` на кожному шляху до `RET`, інакше `RET` зніме не адресу повернення.
+
+Як цього тримаються мої програми:
+
+- `fact` бере `n` в `A`, повертає `n!` в `A`, псує `B`. Перед рекурсивним `CALL` він сам виступає тим, хто викликає: `n` знадобиться після виклику, а `A` стане результатом, тож `n` іде на стек (`PUSH A`) і повертається в `B` (`POP B`).
+- `mul` (Advanced) бере `x` в `A`, `y` в `B`, повертає `x·y` в `A`, псує `B` (за правилом 2 це можна). `H` він використовує як лічильник і повертає незмінним (`PUSH H` на вході, `POP H` перед `RET`).
+- `strlen` (Advanced) бере 16-бітну адресу в `H` (в `A` вона не влазить), повертає довжину в `A` і не змінює `H`. Правило 2 дозволяло б його зіпсувати, але функція, яка ходить пам'яттю, корисніша, коли повертає вказівник туди, де його лишили.
+
+Баг, який видно, лише коли правило записане: у `fact` замість `POP B` (`53`) стоїть `POP A` (`51`):
+
+```txt
+ember> set 24 0x51
+ember> run
+5 
+halted after 60 steps
+ember> regs
+PC=0x0007  A=5  B=1  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember>
+```
+
+Друкує `5`. `fact` «відновив» `n` не туди: він поклав його в `A` поверх результату виклику, а `B` лишився з одиницею, яку туди поклав викликаний `fact`. Тож кожен рівень рахує `n · 1`, і назад доходить `5`. Хто що зберігає, тут не узгоджено: результат в `A` (правило 1) затерто власним збереженням.
+
+## Advanced
+
+### `MUL` підпрограмою
+
+`fact` той самий, лише `MUL A, B` замінено на `CALL mul` (3 байти замість одного, тож `base` з'їхав на `0x001D`, а обидва `JZ base` тепер `1D 00`). `mul` множить повторним додаванням. Сума накопичується в `A`, `x` лежить у `B`, а третє живе значення — лічильник — у двох 8-бітних регістрах уже не вміщається, тож він у `H`. Лічильник копіюється з `B` в `H` циклом `INCH`, а «чи нуль» перевіряється через `HLOW` і `INC A`/`DEC A`. `H` того, хто викликав, `mul` зберігає на стеку:
+
+```txt
+адр.  байти        текст
+0000  20 05                 LOADI A, 5       ; n = 5
+0002  54 07 00              CALL  fact
+0005  03                    OUTN
+0006  00                    HALT
+
+; fact(n): як у ISA §6, але MUL A, B — виклик підпрограми mul.
+0007  21 00        fact:    LOADI B, 0
+0009  1A                    CMP   A, B       ; n == 0 ?
+000A  31 1D 00              JZ    base
+000D  21 01                 LOADI B, 1
+000F  1A                    CMP   A, B       ; n == 1 ?
+0010  31 1D 00              JZ    base
+0013  50                    PUSH  A          ; зберегти n — виклик знищить A
+0014  19                    DEC   A
+0015  54 07 00              CALL  fact       ; A = fact(n-1)
+0018  53                    POP   B          ; B = збережене n
+0019  54 20 00              CALL  mul        ; A = fact(n-1) * n
+001C  55                    RET
+001D  20 01        base:    LOADI A, 1
+001F  55                    RET
+
+; mul(A = x, B = y): A = x*y mod 256 додаванням. Псує B; H зберігає.
+0020  56           mul:     PUSH  H          ; H того, хто викликав
+0021  50                    PUSH  A          ; x
+0022  26                    MOV   A, B       ; A = y
+0023  28 00 00              LOADH H, 0x0000  ; лічильник = 0
+0026  18           cnt:     INC   A
+0027  19                    DEC   A          ; Z, якщо A == 0
+0028  31 30 00              JZ    go
+002B  2B                    INCH             ; лічильник += 1
+002C  19                    DEC   A
+002D  30 26 00              JMP   cnt
+0030  53           go:      POP   B          ; B = x; A = 0 — сума
+0031  50           add:     PUSH  A          ; сума
+0032  2D                    HLOW             ; A = лічильник
+0033  18                    INC   A
+0034  19                    DEC   A          ; Z, якщо лічильник == 0
+0035  51                    POP   A          ; сума (POP прапорці не чіпає)
+0036  31 3E 00              JZ    done
+0039  10                    ADD   A, B       ; сума += x
+003A  2C                    DECH             ; лічильник -= 1
+003B  30 31 00              JMP   add
+003E  57           done:    POP   H          ; H того, хто викликав
+003F  55                    RET
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x05
+ember> set 2 0x54
+ember> set 3 0x07
+ember> set 4 0x00
+ember> set 5 0x03
+ember> set 6 0x00
+ember> set 7 0x21
+ember> set 8 0x00
+ember> set 9 0x1A
+ember> set 10 0x31
+ember> set 11 0x1D
+ember> set 12 0x00
+ember> set 13 0x21
+ember> set 14 0x01
+ember> set 15 0x1A
+ember> set 16 0x31
+ember> set 17 0x1D
+ember> set 18 0x00
+ember> set 19 0x50
+ember> set 20 0x19
+ember> set 21 0x54
+ember> set 22 0x07
+ember> set 23 0x00
+ember> set 24 0x53
+ember> set 25 0x54
+ember> set 26 0x20
+ember> set 27 0x00
+ember> set 28 0x55
+ember> set 29 0x20
+ember> set 30 0x01
+ember> set 31 0x55
+ember> set 32 0x56
+ember> set 33 0x50
+ember> set 34 0x26
+ember> set 35 0x28
+ember> set 36 0x00
+ember> set 37 0x00
+ember> set 38 0x18
+ember> set 39 0x19
+ember> set 40 0x31
+ember> set 41 0x30
+ember> set 42 0x00
+ember> set 43 0x2B
+ember> set 44 0x19
+ember> set 45 0x30
+ember> set 46 0x26
+ember> set 47 0x00
+ember> set 48 0x53
+ember> set 49 0x50
+ember> set 50 0x2D
+ember> set 51 0x18
+ember> set 52 0x19
+ember> set 53 0x51
+ember> set 54 0x31
+ember> set 55 0x3E
+ember> set 56 0x00
+ember> set 57 0x10
+ember> set 58 0x2C
+ember> set 59 0x30
+ember> set 60 0x31
+ember> set 61 0x00
+ember> set 62 0x57
+ember> set 63 0x55
+ember> run
+120 
+halted after 334 steps
+ember> regs
+PC=0x0007  A=120  B=24  H=0x0000  SP=0x0fff  Z=1 N=0 C=0
+ember> stack
+SP=0x0fff  empty, 256 free (stack 0x0f00-0x0fff); deepest SP=0x0fef (16 bytes)
+ember>
+```
+
+Опкод проти підпрограми, кожна клітинка — окремий запуск `./build/ember` (скрипт `steps.py`):
+
+```txt
+n | MUL: вивід кроків  SP після  найглибше  прапорці    | CALL mul: вивід кроків  SP після  найглибше  прапорці
+0 |          1      9    0x0fff     0x0ffd  Z=1 N=0 C=0 |               1      9    0x0fff     0x0ffd  Z=1 N=0 C=0
+1 |          1     12    0x0fff     0x0ffd  Z=1 N=0 C=0 |               1     12    0x0fff     0x0ffd  Z=1 N=0 C=0
+2 |          2     24    0x0fff     0x0ffa  Z=0 N=0 C=0 |               2     70    0x0fff     0x0ff8  Z=1 N=0 C=0
+3 |          6     36    0x0fff     0x0ff7  Z=0 N=0 C=0 |               6    143    0x0fff     0x0ff5  Z=1 N=0 C=0
+5 |        120     60    0x0fff     0x0ff1  Z=0 N=0 C=0 |             120    334    0x0fff     0x0fef  Z=1 N=0 C=0
+6 |        208     72    0x0fff     0x0fee  Z=0 N=1 C=1 |             208    452    0x0fff     0x0fec  Z=1 N=0 C=0
+```
+
+`fact(5)` — 334 кроки проти 60. Кожен виклик `mul(x, y)` додає до кроків `fact` 16 + 15y: по 6 інструкцій на кожну одиницю `y` при копіюванні в лічильник і по 9 на кожне з `y` додавань, плюс 16 на вхід, вихід і останні перевірки. `fact` передає в `B` саме `n`, тож лічильник малий, а від `x` = `fact(n-1)` кількість кроків не залежить. Так множить восьмибітна машина без множника. Стек опускається на 2 байти глибше. Найглибше місце — `mul`, викликаний із `fact(2)`: три байти цього рівня (`n` і адреса повернення з `fact(1)`) уже зняті, а `mul` кладе п'ять (адреса повернення, `H`, `x`). `fact(0)` і `fact(1)` до `mul` не доходять — кроки ті самі.
+
+Прапорці після `mul` — не прапорці `MUL`. Останнє, що їх виставляє, — `INC A`/`DEC A` на нульовому лічильнику, тож після `mul` завжди `Z=1 N=0`, а `C` лишається від останнього `ADD`. Для `fact(6)` це `C=0`, хоча 720 не влізло (опкод дає `C=1`). Конвенція нічого не обіцяє про прапорці, але `JZ` одразу після `CALL mul` стрибав би завжди.
+
+### `PUSH H` / `POP H`: `strlen`
+
+`PUSH H` кладе 2 байти — молодший, потім старший, — як `CALL` адресу повернення. `POP H` знімає старший, потім молодший (ті самі `push16`/`pop16`). `strlen` ходить рядком за `H` і повертає вказівник на місце. Рядок `"HI"` — у `0x0800`:
+
+```txt
+адр.  байти        текст
+0000  28 00 08              LOADH H, 0x0800  ; "HI" у 0x0800
+0003  54 0A 00              CALL  strlen
+0006  03                    OUTN             ; 2
+0007  29                    LOAD  A, [H]     ; перший байт рядка — H цілий
+0008  03                    OUTN             ; 72 = 'H'
+0009  00                    HALT
+
+; strlen(H): A = довжина рядка з H (до 0). Псує B; H зберігає.
+000A  56           strlen:  PUSH  H          ; H того, хто викликав
+000B  21 00                 LOADI B, 0       ; довжина = 0
+000D  29           loop:    LOAD  A, [H]
+000E  18                    INC   A
+000F  19                    DEC   A          ; Z: дійшли до 0
+0010  31 1A 00              JZ    end
+0013  26                    MOV   A, B
+0014  18                    INC   A
+0015  27                    MOV   B, A       ; довжина += 1
+0016  2B                    INCH             ; до наступного байта
+0017  30 0D 00              JMP   loop
+001A  26           end:     MOV   A, B       ; A = довжина
+001B  57                    POP   H          ; H того, хто викликав
+001C  55                    RET
+```
+
+```txt
+ember> set 0 0x28
+ember> set 1 0x00
+ember> set 2 0x08
+ember> set 3 0x54
+ember> set 4 0x0A
+ember> set 5 0x00
+ember> set 6 0x03
+ember> set 7 0x29
+ember> set 8 0x03
+ember> set 9 0x00
+ember> set 10 0x56
+ember> set 11 0x21
+ember> set 12 0x00
+ember> set 13 0x29
+ember> set 14 0x18
+ember> set 15 0x19
+ember> set 16 0x31
+ember> set 17 0x1A
+ember> set 18 0x00
+ember> set 19 0x26
+ember> set 20 0x18
+ember> set 21 0x27
+ember> set 22 0x2B
+ember> set 23 0x30
+ember> set 24 0x0D
+ember> set 25 0x00
+ember> set 26 0x26
+ember> set 27 0x57
+ember> set 28 0x55
+ember> set 0x800 0x48
+ember> set 0x801 0x49
+ember> trace on
+ember> run
+0000  28 00 08  LOADH H, 0x0800   -> A=  0  B=  0  H=0x0800  SP=0x0fff  Z=0 N=0 C=0
+0003  54 0a 00  CALL 0x000a       -> A=  0  B=  0  H=0x0800  SP=0x0ffd  Z=0 N=0 C=0  top: 00 06
+000a  56        PUSH H            -> A=  0  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000b  21 00     LOADI B, 0x00     -> A=  0  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000d  29        LOAD A, [H]       -> A= 72  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000e  18        INC A             -> A= 73  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000f  19        DEC A             -> A= 72  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0010  31 1a 00  JZ 0x001a         -> A= 72  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0013  26        MOV A, B          -> A=  0  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0014  18        INC A             -> A=  1  B=  0  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0015  27        MOV B, A          -> A=  1  B=  1  H=0x0800  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0016  2b        INCH              -> A=  1  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0017  30 0d 00  JMP 0x000d        -> A=  1  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000d  29        LOAD A, [H]       -> A= 73  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000e  18        INC A             -> A= 74  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000f  19        DEC A             -> A= 73  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0010  31 1a 00  JZ 0x001a         -> A= 73  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0013  26        MOV A, B          -> A=  1  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0014  18        INC A             -> A=  2  B=  1  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0015  27        MOV B, A          -> A=  2  B=  2  H=0x0801  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0016  2b        INCH              -> A=  2  B=  2  H=0x0802  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+0017  30 0d 00  JMP 0x000d        -> A=  2  B=  2  H=0x0802  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000d  29        LOAD A, [H]       -> A=  0  B=  2  H=0x0802  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000e  18        INC A             -> A=  1  B=  2  H=0x0802  SP=0x0ffb  Z=0 N=0 C=0  top: 08 00
+000f  19        DEC A             -> A=  0  B=  2  H=0x0802  SP=0x0ffb  Z=1 N=0 C=0  top: 08 00
+0010  31 1a 00  JZ 0x001a         -> A=  0  B=  2  H=0x0802  SP=0x0ffb  Z=1 N=0 C=0  top: 08 00
+001a  26        MOV A, B          -> A=  2  B=  2  H=0x0802  SP=0x0ffb  Z=1 N=0 C=0  top: 08 00
+001b  57        POP H             -> A=  2  B=  2  H=0x0800  SP=0x0ffd  Z=1 N=0 C=0  top: 00 06
+001c  55        RET               -> A=  2  B=  2  H=0x0800  SP=0x0fff  Z=1 N=0 C=0
+2 
+0006  03        OUTN              -> A=  2  B=  2  H=0x0800  SP=0x0fff  Z=1 N=0 C=0
+0007  29        LOAD A, [H]       -> A= 72  B=  2  H=0x0800  SP=0x0fff  Z=1 N=0 C=0
+72 
+0008  03        OUTN              -> A= 72  B=  2  H=0x0800  SP=0x0fff  Z=1 N=0 C=0
+0009  00        HALT              -> A= 72  B=  2  H=0x0800  SP=0x0fff  Z=1 N=0 C=0
+halted after 33 steps
+ember> regs
+PC=0x000a  A=72  B=2  H=0x0800  SP=0x0fff  Z=1 N=0 C=0
+ember>
+```
+
+Після `PUSH H` вершина — `08 00` (старший `0x08` поклали останнім, `H = 0x0800`). `strlen` дійшов до нуля з `H = 0x0802`, `POP H` повернув `0x0800`, і головна програма читає `LOAD A, [H]` перший байт рядка: `72` = `'H'`. Та сама програма, де `PUSH H`/`POP H` стали `NOP`:
+
+```txt
+ember> set 0 0x28
+ember> set 1 0x00
+ember> set 2 0x08
+ember> set 3 0x54
+ember> set 4 0x0A
+ember> set 5 0x00
+ember> set 6 0x03
+ember> set 7 0x29
+ember> set 8 0x03
+ember> set 9 0x00
+ember> set 10 0x01
+ember> set 11 0x21
+ember> set 12 0x00
+ember> set 13 0x29
+ember> set 14 0x18
+ember> set 15 0x19
+ember> set 16 0x31
+ember> set 17 0x1A
+ember> set 18 0x00
+ember> set 19 0x26
+ember> set 20 0x18
+ember> set 21 0x27
+ember> set 22 0x2B
+ember> set 23 0x30
+ember> set 24 0x0D
+ember> set 25 0x00
+ember> set 26 0x26
+ember> set 27 0x01
+ember> set 28 0x55
+ember> set 0x800 0x48
+ember> set 0x801 0x49
+ember> run
+2 0 
+halted after 33 steps
+ember> regs
+PC=0x000a  A=0  B=2  H=0x0802  SP=0x0fff  Z=1 N=0 C=0
+ember>
+```
+
+Тепер `H` лишився на термінаторі, і головна програма читає `0`.
+
+### `Stack` на зв'язаних вузлах
+
+Друге сховище — `src/stack_list.cpp`: вузол на кожен байт, у купі хоста, найновіший у `Stack::top`. Визначає ті самі гачки з `stack_store.hpp`, що й `stack_array.cpp`:
+
+```cpp
+// Keep `v` as the new top, at guest address SP (SP not moved yet). False:
+// no room to keep it (the list could not get a node); nothing changed.
+bool store_push(CPU& cpu, Byte v);
+
+// Take the top byte, the one at SP + 1 (SP not moved yet). Never empty.
+Byte store_pop(CPU& cpu);
+
+// The i-th byte from the top (0 = at SP + 1). i < stack_used.
+Byte store_peek(const CPU& cpu, std::size_t i);
+
+// SP is about to become `sp`: from now on the stack is the guest bytes
+// sp + 1 .. STACK_HI. False: could not (nothing changed).
+bool store_resync(CPU& cpu, std::uint16_t sp);
+
+// Give back whatever the representation holds.
+void store_clear(Stack& s);
+```
+
+```cpp
+bool store_push(CPU& cpu, Byte v) { return guest_write(cpu, cpu.stack.sp, v); }
+
+Byte store_pop(CPU& cpu) { return store_peek(cpu, 0); }
+
+Byte store_peek(const CPU& cpu, std::size_t i) {
+    Byte v = 0;
+    guest_read(cpu, cpu.stack.sp + 1 + i, v);
+    return v;
+}
+```
+
+```cpp
+struct StackNode {
+    Byte value;
+    StackNode* next; // the node pushed before this one; nullptr at the bottom
+};
+
+bool store_push(CPU& cpu, Byte v) {
+    StackNode* n = make_node(v, cpu.stack.top);
+    if (n == nullptr)
+        return false;
+    guest_write(cpu, cpu.stack.sp, v); // the mirror byte at mem[SP]
+    cpu.stack.top = n;
+    return true;
+}
+
+Byte store_pop(CPU& cpu) {
+    StackNode* n = cpu.stack.top;
+    if (n == nullptr) // stack.cpp never pops an empty stack
+        return 0;
+    const Byte v = n->value;
+    cpu.stack.top = n->next;
+    delete n;
+    return v;
+}
+```
+
+Вузли беруться через `new (std::nothrow)`, без винятків: `nullptr` означає «місця немає», і `push` відмовляє. Перед виходом `main` викликає `stack_clear()`, тож LeakSanitizer мовчить. ISA каже, що `PUSH` пише `mem[SP]`, тому список **теж** пише байт у пам'ять гостя — дзеркало. Через це `SP`, `get`, `dump` і `LOAD` в обох збірках однакові. Але `POP` і `RET` у списку беруть значення з вузла, а не з пам'яті.
+
+Яке сховище збирати, вирішує лише CMake (`EMBER_STACK`, див. M4); у вихідних текстах немає жодного `#ifdef`. Друга збірка:
+
+```sh
+cmake -S . -B build/list -DCMAKE_BUILD_TYPE=Debug -DEMBER_STACK=list
+cmake --build build/list
+```
+
+Перевірка: `grep -n 'EMBER_STACK\|#if' src/cpu.cpp src/stack.hpp src/stack.cpp` і `grep -rln '#if' src/` не знаходять жодного рядка:
+
+```txt
+grep exit 1 (1 — жодного рядка)
+grep exit 1 (1 — у src/ немає жодного #if)
+```
+
+`cpu.cpp`, `stack.hpp`, `stack.cpp` — ті самі файли в обох збірках. Усі файли перевірок Lab 1–7 на обох:
+
+```sh
+#!/bin/sh
+# The array build (build/) and the list build (build/list/) on every check
+# file of Labs 1-7: the outputs must be byte for byte the same, both exit 0,
+# both with an empty stderr (ASan, UBSan and LeakSanitizer say nothing).
+t=$(mktemp -d)
+for f in docs/checks/lab-01.txt notes-local/lab-0[2-7]/upstream/checks/lab-0?.txt; do
+    ./build/ember < "$f" > "$t/a.out" 2> "$t/a.err"; ea=$?
+    ./build/list/ember < "$f" > "$t/l.out" 2> "$t/l.err"; el=$?
+    if cmp -s "$t/a.out" "$t/l.out" && [ ! -s "$t/a.err" ] && [ ! -s "$t/l.err" ] &&
+       [ $ea -eq 0 ] && [ $el -eq 0 ]; then
+        echo "$(basename "$f"): array = list, $(wc -l < "$t/a.out") lines, exit 0, stderr empty"
+    else
+        echo "$(basename "$f"): DIFFERENT (exit $ea/$el)"
+    fi
+done
+rm -rf "$t"
+```
+
+```txt
+lab-01.txt: array = list, 262 lines, exit 0, stderr empty
+lab-02.txt: array = list, 7 lines, exit 0, stderr empty
+lab-03.txt: array = list, 4 lines, exit 0, stderr empty
+lab-04.txt: array = list, 4 lines, exit 0, stderr empty
+lab-05.txt: array = list, 35 lines, exit 0, stderr empty
+lab-07.txt: array = list, 5 lines, exit 0, stderr empty
+```
+
+Різниця з'являється тоді, коли в живу частину стека пише хтось інший, а не `PUSH`. Наприклад, гість — `STORE` прямо в `0xFFF`:
+
+```txt
+адр.  байти        текст
+0000  20 07        LOADI A, 7
+0002  50           PUSH  A                   ; mem[0xFFF] = 7
+0003  20 09        LOADI A, 9
+0005  24 FF 0F     STORE [0x0FFF], A         ; гість пише прямо в стек
+0008  51           POP   A                   ; масив: 9, список: 7
+0009  03           OUTN
+000A  00           HALT
+```
+
+Масив:
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x07
+ember> set 2 0x50
+ember> set 3 0x20
+ember> set 4 0x09
+ember> set 5 0x24
+ember> set 6 0xFF
+ember> set 7 0x0F
+ember> set 8 0x51
+ember> set 9 0x03
+ember> set 10 0x00
+ember> run
+9 
+halted after 7 steps
+ember> get 0xFFF
+9  0x09  0b00001001  '.'
+ember>
+```
+
+Список:
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x07
+ember> set 2 0x50
+ember> set 3 0x20
+ember> set 4 0x09
+ember> set 5 0x24
+ember> set 6 0xFF
+ember> set 7 0x0F
+ember> set 8 0x51
+ember> set 9 0x03
+ember> set 10 0x00
+ember> run
+7 
+halted after 7 steps
+ember> get 0xFFF
+9  0x09  0b00001001  '.'
+ember>
+```
+
+У масиві `POP A` зняв те, що записав `STORE`, у списку — значення з вузла, хоча в пам'яті вже `9`. Так само діє будь-який запис хоста в живий стек (`set`, `set16`, `inc`, `sort`). Тоді `stack` і хвіст `top:` у списку показують вузли, а не байти за підписаними адресами, і `stack` розходиться з `get`:
+
+```txt
+ember> reg a 7
+ember> set 0 0x50
+ember> set 1 0x51
+ember> step
+0000  50        PUSH A            -> A=  7  B=  0  H=0x0000  SP=0x0ffe  Z=0 N=0 C=0  top: 07
+ember> set 0xFFF 9
+ember> stack
+SP=0x0ffe  1 byte on the stack, 255 free (stack 0x0f00-0x0fff); deepest SP=0x0ffe (1 byte)
+  0x0fff  07  <- top
+ember> get 0xFFF
+9  0x09  0b00001001  '.'
+ember> step
+0001  51        POP A             -> A=  7  B=  0  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember>
+```
+
+По одній перевазі:
+
+- **масив** — стек і є ті байти `mem[SP]`, які описує ISA. Що бачать гість, `dump` і `get`, те й зніме `POP`. Пам'яті хоста не потрібно: `push` — це O(1), він не може не вдатися через нестачу пам'яті хоста, і витоку бути не може;
+- **список** — представлення сховане від гостя. `STORE` у стек не змінить того, що зніме `RET`, тож адресу повернення програма не перепише. Місткість не зашита в сховище (256 — лише правило в `stack.cpp`), а у вузол можна покласти ще щось — наприклад, адресу інструкції, яка його поклала.
+
+Обрав масив (він і збирається за замовчуванням): ISA визначає стек як байти пам'яті, і лише масив робить це буквально. Списку доводиться писати дзеркальні байти, і після запису в стек збоку він показує одне, а в пам'яті лежить інше.
+
+## Якщо встигаєте
+
+`MUL` підпрограмою, `PUSH H`/`POP H` зі `strlen` і стек на вузлах — у розділі Advanced вище.
+
+### Godbolt — хвостовий `fact` проти наївного
+
+```cpp
+// naive: the multiplication waits for the call to come back
+int fact(int n) {
+    if (n <= 1) return 1;
+    return n * fact(n - 1);
+}
+
+// tail: the call is the last thing; the product rides in acc
+int fact_acc(int n, int acc) {
+    if (n <= 1) return acc;
+    return fact_acc(n - 1, acc * n);
+}
+```
+
+Compiler Explorer, `g162` (x86-64 gcc 16.2) і `clang2310` (x86-64 clang 23.1.0, найновіший випуск), `-O0` і `-O2`, ті самі фільтри, що в Lab 04. Запит через API (`body.json` для `g162 -O2`; решта відрізняються лише `userArguments`):
+
+```json
+{
+  "source": "// naive: the multiplication waits for the call to come back\nint fact(int n) {\n    if (n <= 1) return 1;\n    return n * fact(n - 1);\n}\n\n// tail: the call is the last thing; the product rides in acc\nint fact_acc(int n, int acc) {\n    if (n <= 1) return acc;\n    return fact_acc(n - 1, acc * n);\n}\n",
+  "options": {
+    "userArguments": "-O2",
+    "filters": {
+      "intel": true,
+      "directives": true,
+      "labels": true,
+      "commentOnly": true,
+      "demangle": true
+    }
+  }
+}
+```
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' -H 'Accept: text/plain' \
+     --data @body.json https://godbolt.org/api/compiler/g162/compile
+```
+
+`g162`, `-O0`:
+
+```txt
+# Compilation provided by Compiler Explorer at https://godbolt.org/
+"fact(int)":
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 16
+        mov     DWORD PTR [rbp-4], edi
+        cmp     DWORD PTR [rbp-4], 1
+        jg      .L2
+        mov     eax, 1
+        jmp     .L3
+.L2:
+        mov     eax, DWORD PTR [rbp-4]
+        sub     eax, 1
+        mov     edi, eax
+        call    "fact(int)"
+        imul    eax, DWORD PTR [rbp-4]
+.L3:
+        leave
+        ret
+"fact_acc(int, int)":
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 16
+        mov     DWORD PTR [rbp-4], edi
+        mov     DWORD PTR [rbp-8], esi
+        cmp     DWORD PTR [rbp-4], 1
+        jg      .L5
+        mov     eax, DWORD PTR [rbp-8]
+        jmp     .L6
+.L5:
+        mov     eax, DWORD PTR [rbp-8]
+        imul    eax, DWORD PTR [rbp-4]
+        mov     edx, DWORD PTR [rbp-4]
+        sub     edx, 1
+        mov     esi, eax
+        mov     edi, edx
+        call    "fact_acc(int, int)"
+        nop
+.L6:
+        leave
+        ret
+```
+
+`g162`, `-O2`:
+
+```txt
+# Compilation provided by Compiler Explorer at https://godbolt.org/
+"fact(int)":
+        mov     eax, 1
+        cmp     edi, 1
+        jle     .L1
+.L2:
+        imul    eax, edi
+        sub     edi, 1
+        cmp     edi, 1
+        jne     .L2
+.L1:
+        ret
+"fact_acc(int, int)":
+        mov     eax, esi
+        cmp     edi, 1
+        jle     .L14
+        test    dil, 1
+        jne     .L11
+        imul    eax, edi
+        sub     edi, 1
+        cmp     edi, 1
+        je      .L25
+.L11:
+        imul    eax, edi
+        lea     edx, [rdi-1]
+        sub     edi, 2
+        imul    eax, edx
+        cmp     edi, 1
+        jne     .L11
+.L14:
+        ret
+.L25:
+        ret
+```
+
+Скільки рядків `call` у кожній із чотирьох відповідей для `fact.cpp` (`clang2310 -O2` — довгий векторизований цикл на SSE, тому тут лише підрахунок):
+
+```txt
+gb-fact-clang2310-O0.txt: 2
+gb-fact-clang2310-O2.txt: 0
+gb-fact-g162-O0.txt: 2
+gb-fact-g162-O2.txt: 0
+```
+
+На `-O0` обидва `fact` — справжня рекурсія (`call "fact(int)"` і `call "fact_acc(int, int)"`). На `-O2` обидва компілятори перетворили на цикл **обидва**. З хвостовим `fact_acc` це очікувано: виклик останній, кадр можна перевикористати. Але й наївний `n * fact(n - 1)` став циклом `imul`/`sub`/`jne`: компілятор сам переніс множення в акумулятор, бо множення асоціативне. Розраховувати на це, як і каже теорія, не можна: на `-O0` (наша Debug-збірка) рекурсія лишається рекурсією.
+
+### `inline` проти звичайної функції
+
+```cpp
+inline int sq(int x) { return x * x; }
+int sq2(int x) { return x * x; }
+
+int use(int a, int b) { return sq(a) + sq2(b); }
+```
+
+`g162`, `-O0`:
+
+```txt
+# Compilation provided by Compiler Explorer at https://godbolt.org/
+"sq(int)":
+        push    rbp
+        mov     rbp, rsp
+        mov     DWORD PTR [rbp-4], edi
+        mov     eax, DWORD PTR [rbp-4]
+        imul    eax, eax
+        pop     rbp
+        ret
+"sq2(int)":
+        push    rbp
+        mov     rbp, rsp
+        mov     DWORD PTR [rbp-4], edi
+        mov     eax, DWORD PTR [rbp-4]
+        imul    eax, eax
+        pop     rbp
+        ret
+"use(int, int)":
+        push    rbp
+        mov     rbp, rsp
+        push    rbx
+        sub     rsp, 24
+        mov     DWORD PTR [rbp-20], edi
+        mov     DWORD PTR [rbp-24], esi
+        mov     eax, DWORD PTR [rbp-20]
+        mov     edi, eax
+        call    "sq(int)"
+        mov     ebx, eax
+        mov     eax, DWORD PTR [rbp-24]
+        mov     edi, eax
+        call    "sq2(int)"
+        add     eax, ebx
+        mov     rbx, QWORD PTR [rbp-8]
+        leave
+        ret
+```
+
+`g162`, `-O2`:
+
+```txt
+# Compilation provided by Compiler Explorer at https://godbolt.org/
+"sq2(int)":
+        imul    edi, edi
+        mov     eax, edi
+        ret
+"use(int, int)":
+        imul    edi, edi
+        imul    esi, esi
+        lea     eax, [rdi+rsi]
+        ret
+```
+
+На `-O0` обидві функції викликаються через `call`, на `-O2` обидві вбудовані в `use` (два `imul`, жодного `call`). `inline` не наказує компілятору вбудувати функцію: це вирішує оптимізатор, а на `-O0` він не вбудовує нічого. Єдина видима різниця на `-O2` — `sq` більше не видається окремо, а `sq2` видається: її може викликати інший `.cpp`. Справжнє значення `inline` — для лінкера. Визначення в заголовку, який включено у два `.cpp`:
+
+```cpp
+// sq.hpp
+#pragma once
+int sq(int x) { return x * x; }
+```
+
+```cpp
+// sq_inline.hpp
+#pragma once
+inline int sq(int x) { return x * x; }
+```
+
+```cpp
+// one.cpp
+#include SQ_HEADER
+int one() { return sq(3); }
+```
+
+```cpp
+// two.cpp
+#include <iostream>
+#include SQ_HEADER
+int one();
+int main() { std::cout << one() + sq(4) << '\n'; }
+```
+
+```txt
+$ c++ -std=c++17 -Wall -Wextra -Werror -DSQ_HEADER='"sq.hpp"' one.cpp two.cpp -o sq && ./sq
+/usr/bin/ld: /tmp/ccGmbc8W.o: in function `sq(int)':
+two.cpp:(.text+0x0): multiple definition of `sq(int)'; /tmp/ccSLjkH1.o:one.cpp:(.text+0x0): first defined here
+collect2: error: ld returned 1 exit status
+[exit 1]
+$ c++ -std=c++17 -Wall -Wextra -Werror -DSQ_HEADER='"sq_inline.hpp"' one.cpp two.cpp -o sq && ./sq
+25
+[exit 0]
+```
+
+Без `inline` кожен `.cpp` отримує власне визначення `sq`, і лінкер бачить два (як у notes §3). З `inline` дозволено однакове визначення в кожній одиниці трансляції, і лінкер лишає одне.
+
+### Макроси, що обчислюють `x++` двічі
+
+```cpp
+#include <iostream>
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+inline int max_fn(int a, int b) { return a > b ? a : b; }
+
+int main() {
+    int i = 5;
+    int m = MAX(i++, 0); // ((i++) > (0) ? (i++) : (0)): i++ runs twice
+    std::cout << "MAX:    m=" << m << " i=" << i << '\n';
+    int j = 5;
+    int k = max_fn(j++, 0); // j++ runs once, before the call
+    std::cout << "max_fn: k=" << k << " j=" << j << '\n';
+}
+```
+
+```txt
+$ c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined max.cpp -o scratch && ./scratch
+MAX:    m=6 i=7
+max_fn: k=5 j=6
+[exit 0]
+```
+
+`MAX(i++, 0)` розгортається в `((i++) > (0) ? (i++) : (0))`: `i++` виконується двічі, тож `m = 6` і `i = 7`, хоча мали б бути 5 і 6. Поведінка визначена (умова `?:` обчислюється повністю раніше за гілку), просто результат не той. Функція обчислює аргумент один раз. Гірший випадок:
+
+```cpp
+#include <iostream>
+#define SQ(x) ((x) * (x))
+
+int main() {
+    int i = 3;
+    int s = SQ(i++); // ((i++) * (i++)): two unsequenced writes to i
+    std::cout << s << ' ' << i << '\n';
+}
+```
+
+```txt
+$ c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined sq_macro.cpp -o scratch
+sq_macro.cpp: In function ‘int main()’:
+sq_macro.cpp:6:17: error: operation on ‘i’ may be undefined [-Werror=sequence-point]
+    6 |     int s = SQ(i++); // ((i++) * (i++)): two unsequenced writes to i
+      |                 ^
+sq_macro.cpp:2:17: note: in definition of macro ‘SQ’
+    2 | #define SQ(x) ((x) * (x))
+      |                 ^
+cc1plus: all warnings being treated as errors
+[exit 1]
+```
+
+`SQ(i++)` — це `((i++) * (i++))`: два непослідовні записи в `i`, тобто невизначена поведінка. GCC з `-Werror` її не пропускає, тож запускати нічого.
+
+### Шаблон `swap`
+
+```cpp
+#include <cstdint>
+
+template <typename T> void swap(T& a, T& b) {
+    T t = a;
+    a = b;
+    b = t;
+}
+
+void use(int& i, int& j, std::uint8_t& x, std::uint8_t& y, double& p, double& q) {
+    swap(i, j);
+    swap(x, y);
+    swap(p, q);
+}
+```
+
+`g162`, `-O0`:
+
+```txt
+# Compilation provided by Compiler Explorer at https://godbolt.org/
+"use(int&, int&, unsigned char&, unsigned char&, double&, double&)":
+        push    rbp
+        mov     rbp, rsp
+        sub     rsp, 48
+        mov     QWORD PTR [rbp-8], rdi
+        mov     QWORD PTR [rbp-16], rsi
+        mov     QWORD PTR [rbp-24], rdx
+        mov     QWORD PTR [rbp-32], rcx
+        mov     QWORD PTR [rbp-40], r8
+        mov     QWORD PTR [rbp-48], r9
+        mov     rdx, QWORD PTR [rbp-16]
+        mov     rax, QWORD PTR [rbp-8]
+        mov     rsi, rdx
+        mov     rdi, rax
+        call    "void swap<int>(int&, int&)"
+        mov     rdx, QWORD PTR [rbp-32]
+        mov     rax, QWORD PTR [rbp-24]
+        mov     rsi, rdx
+        mov     rdi, rax
+        call    "void swap<unsigned char>(unsigned char&, unsigned char&)"
+        mov     rdx, QWORD PTR [rbp-48]
+        mov     rax, QWORD PTR [rbp-40]
+        mov     rsi, rdx
+        mov     rdi, rax
+        call    "void swap<double>(double&, double&)"
+        nop
+        leave
+        ret
+"void swap<int>(int&, int&)":
+        push    rbp
+        mov     rbp, rsp
+        mov     QWORD PTR [rbp-24], rdi
+        mov     QWORD PTR [rbp-32], rsi
+        mov     rax, QWORD PTR [rbp-24]
+        mov     eax, DWORD PTR [rax]
+        mov     DWORD PTR [rbp-4], eax
+        mov     rax, QWORD PTR [rbp-32]
+        mov     edx, DWORD PTR [rax]
+        mov     rax, QWORD PTR [rbp-24]
+        mov     DWORD PTR [rax], edx
+        mov     rax, QWORD PTR [rbp-32]
+        mov     edx, DWORD PTR [rbp-4]
+        mov     DWORD PTR [rax], edx
+        nop
+        pop     rbp
+        ret
+"void swap<unsigned char>(unsigned char&, unsigned char&)":
+        push    rbp
+        mov     rbp, rsp
+        mov     QWORD PTR [rbp-24], rdi
+        mov     QWORD PTR [rbp-32], rsi
+        mov     rax, QWORD PTR [rbp-24]
+        movzx   eax, BYTE PTR [rax]
+        mov     BYTE PTR [rbp-1], al
+        mov     rax, QWORD PTR [rbp-32]
+        movzx   edx, BYTE PTR [rax]
+        mov     rax, QWORD PTR [rbp-24]
+        mov     BYTE PTR [rax], dl
+        mov     rax, QWORD PTR [rbp-32]
+        movzx   edx, BYTE PTR [rbp-1]
+        mov     BYTE PTR [rax], dl
+        nop
+        pop     rbp
+        ret
+"void swap<double>(double&, double&)":
+        push    rbp
+        mov     rbp, rsp
+        mov     QWORD PTR [rbp-24], rdi
+        mov     QWORD PTR [rbp-32], rsi
+        mov     rax, QWORD PTR [rbp-24]
+        movsd   xmm0, QWORD PTR [rax]
+        movsd   QWORD PTR [rbp-8], xmm0
+        mov     rax, QWORD PTR [rbp-32]
+        movsd   xmm0, QWORD PTR [rax]
+        mov     rax, QWORD PTR [rbp-24]
+        movsd   QWORD PTR [rax], xmm0
+        mov     rax, QWORD PTR [rbp-32]
+        movsd   xmm0, QWORD PTR [rbp-8]
+        movsd   QWORD PTR [rax], xmm0
+        nop
+        pop     rbp
+        ret
+```
+
+Один шаблон дав три функції: `swap<int>`, `swap<unsigned char>` (`std::uint8_t`, як наш `Byte`) і `swap<double>`. Вони відрізняються лише інструкціями пересилання (`mov DWORD`, `movzx`/`mov BYTE`, `movsd`). Компілятор створює функцію для типу там, де бачить тіло шаблону, тому шаблон живе в заголовку цілком, а не як оголошення в `.hpp` плюс визначення в `.cpp`. У `src/` шаблону немає: єдине місце, де `ember` міняє байти місцями, — `sort.cpp`, а він навмисно ходить через `mem_get`/`mem_set` і не бере `Byte&` на `Memory::data`.
+
+### Два операнди `JZ base`
+
+Обидва `JZ base` у даному лістингу — `1B 00`. Вставляю один `NOP` вище за `base` у двох місцях: (а) перед міткою `fact`, тоді зсуваються і `fact`, і `base`; (б) всередині `fact`, перед `PUSH A`, тоді зсувається лише `base`:
+
+```txt
+адр.  байти        текст
+0000  20 05                 LOADI A, 5       ; n = 5
+0002  54 08 00              CALL  fact
+0005  03                    OUTN
+0006  00                    HALT
+0007  01                    NOP              ; вставлено, перед fact
+0008  21 00        fact:    LOADI B, 0
+000A  1A                    CMP   A, B       ; n == 0 ?
+000B  31 1C 00              JZ    base
+000E  21 01                 LOADI B, 1
+0010  1A                    CMP   A, B       ; n == 1 ?
+0011  31 1C 00              JZ    base
+0014  50                    PUSH  A          ; зберегти n — виклик знищить A
+0015  19                    DEC   A
+0016  54 08 00              CALL  fact       ; A = fact(n-1)
+0019  53                    POP   B          ; B = збережене n
+001A  1B                    MUL   A, B       ; A = fact(n-1) * n
+001B  55                    RET
+001C  20 01        base:    LOADI A, 1
+001E  55                    RET
+```
+
+```txt
+адр.  байти        текст
+0000  20 05                 LOADI A, 5       ; n = 5
+0002  54 07 00              CALL  fact
+0005  03                    OUTN
+0006  00                    HALT
+0007  21 00        fact:    LOADI B, 0
+0009  1A                    CMP   A, B       ; n == 0 ?
+000A  31 1C 00              JZ    base
+000D  21 01                 LOADI B, 1
+000F  1A                    CMP   A, B       ; n == 1 ?
+0010  31 1C 00              JZ    base
+0013  01                    NOP              ; вставлено
+0014  50                    PUSH  A          ; зберегти n — виклик знищить A
+0015  19                    DEC   A
+0016  54 07 00              CALL  fact       ; A = fact(n-1)
+0019  53                    POP   B          ; B = збережене n
+001A  1B                    MUL   A, B       ; A = fact(n-1) * n
+001B  55                    RET
+001C  20 01        base:    LOADI A, 1
+001E  55                    RET
+```
+
+Обидва варіанти набрано `set`-ами й запущено, байти прочитано через `dump 0 32` (скрипт `o9.py`; який байт є операндом, бере з лістингу):
+
+```txt
+== fact: prints 120, halted after 60 steps
+0000  20 05 54 07 00 03 00 21 00 1a 31 1b 00 21 01 1a  | .T....!..1..!..|
+0010  31 1b 00 50 19 54 07 00 53 1b 55 20 01 55 00 00  |1..P.T..S.U .U..|
+== fact_nop_top: prints 120, halted after 60 steps
+0000  20 05 54 08 00 03 00 01 21 00 1a 31 1c 00 21 01  | .T.....!..1..!.|
+0010  1a 31 1c 00 50 19 54 08 00 53 1b 55 20 01 55 00  |.1..P.T..S.U .U.|
+operand bytes changed: 4 — CALL  fact: 07 00 -> 08 00; JZ    base: 1b 00 -> 1c 00; JZ    base: 1b 00 -> 1c 00; CALL  fact: 07 00 -> 08 00
+positions 0x00-0x1f that differ from the original: 25 of 32
+== fact_nop_mid: prints 120, halted after 64 steps
+0000  20 05 54 07 00 03 00 21 00 1a 31 1c 00 21 01 1a  | .T....!..1..!..|
+0010  31 1c 00 01 50 19 54 07 00 53 1b 55 20 01 55 00  |1...P.T..S.U .U.|
+operand bytes changed: 2 — JZ    base: 1b 00 -> 1c 00; JZ    base: 1b 00 -> 1c 00
+positions 0x00-0x1f that differ from the original: 14 of 32
+```
+
+Одна вставлена інструкція змінила 4 байти операндів у (а) (два `CALL fact` і два `JZ base`) і 2 у (б) (обидва `JZ base`). Решта байтів після вставки просто посунулись на одну позицію, і в 32 байтах відрізняються 25 і 14 позицій. Програма друкує `120`, але кожну адресу в лістингу довелося перерахувати руками. Тут зупиняюсь: перераховувати мітки — робота асемблера з Lab 8.
+
+## Реалізовані рядки [ISA.uk.md](https://github.com/rmalkevy/Programming-Practice-Projects/blob/main/courses/programming-fundamentals/ISA.uk.md) (Лаба 7)
+
+| Частина | Розмір | Примітки |
+|---|---|---|
+| `SP` | 16 бітів | вказівник стека. Стартує з `0xFFF` (Lab 7) |
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x1B` | `MUL A, B` | 1 | Z N C | `A = A * B`, молодші 8 бітів; `C` виставляється, якщо справжній добуток не вліз | 7 |
+
+Стек **порожній спадний**: `SP` завжди вказує на наступний вільний байт.
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x50` | `PUSH A` | 1 | — | `mem[SP] = A; SP = SP - 1` | 7 |
+| `0x51` | `POP A` | 1 | — | `SP = SP + 1; A = mem[SP]` | 7 |
+| `0x52` | `PUSH B` | 1 | — | те саме з `B` | 7 |
+| `0x53` | `POP B` | 1 | — | те саме з `B` | 7 |
+| `0x54` | `CALL addr16` | 3 | — | покласти адресу повернення (2 байти), потім `PC = addr` | 7 |
+| `0x55` | `RET` | 1 | — | зняти 2 байти в `PC` | 7 |
+| `0x56` | `PUSH H` | 1 | — | *opt* покласти `H` (2 байти: молодший, потім старший) | 7 |
+| `0x57` | `POP H` | 1 | — | *opt* зняти 2 байти в `H` | 7 |
+
+`SP` нижче за `STACK_LO` — це **переповнення стека**; `SP` на рівні `STACK_HI`
+або вище під час зняття — це **спустошення**. В обох випадках машина має
+зупинитись із повідомленням: ніколи не падати процесом і ніколи тихо не
+загортатись.
+
+`PUSH H`/`POP H` в ISA позначені *opt*; реалізовані обидва. Конвенція виклику — розділ «Конвенція виклику» вище, псевдокод `CALL`/`RET` — у M2.
+
+| Регіон | Діапазон | Константа | З'являється в |
+|---|---|---|---|
+| Стек | `0xF00`–`0xFFF` | `STACK_LO`, `STACK_HI` | Lab 7 |
+
+## Власні розширення
+
+Нових власних опкодів у Лабі 7 немає: `MUL` і вся група `0x5_` — рядки ISA. `0x1C`–`0x1F` і `0x58`–`0x5F` лишаються невідомими опкодами. `JG`/`JL` (`0x70`/`0x71`) — як у Lab 04, `FREE` (`0x72`) — як у Lab 06, байт стану — `0xB02`, як у Lab 05. Уточнення рядків ISA, яких таблиця не каже:
+
+- `CALL`, `PUSH H` спершу перевіряють місце під обидва байти, а `RET`, `POP H` — що на стеку є обидва. Інакше крок відмовляє, нічого не змінивши: на стеку ніколи не лишається половина адреси.
+- `CALL` на адресу `>= 4096` і `RET`, що зняв би таку адресу, — помилка на самій інструкції (як для стрибків у Lab 04), `SP` і стек не змінюються. Перший транскрипт — даний `fact`, у якому операнд рекурсивного `CALL` (байти `0x16`–`0x17`) замінено на `0x1800`. У другому адресу `0x1800` покладено на стек руками (`set` і `reg sp`):
+
+```txt
+ember> set16 22 0x1800
+ember> run
+address 0x1800 is outside 0..4095 (CALL 0x1800 at 0x0015); nothing done
+stopped after 10 steps
+ember> regs
+PC=0x0015  A=4  B=1  H=0x0000  SP=0x0ffc  Z=0 N=0 C=0
+ember>
+```
+
+```txt
+ember> set 0xFFE 0x18
+ember> reg sp 0xFFD
+ember> stack
+SP=0x0ffd  2 bytes on the stack, 254 free (stack 0x0f00-0x0fff); deepest SP=0x0ffd (2 bytes)
+  0x0ffe  18  <- top
+  0x0fff  00
+ember> set 0 0x55
+ember> step
+address 0x1800 is outside 0..4095 (RET at 0x0000); nothing done
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  SP=0x0ffd  Z=0 N=0 C=0
+ember>
+```
+
+- `PUSH`/`CALL` пишуть, а `POP`/`RET` (у збірці «масив») читають байти стека через ті самі `guest_write`/`guest_read`, що й `STORE`/`LOAD`. Регіон стека не перетинається з `PORT_OUT`/`TICKS`, але правило одне для всіх звертань гостя.

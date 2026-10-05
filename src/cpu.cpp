@@ -9,6 +9,7 @@
 #include "guest_io.hpp"
 #include "heap.hpp"
 #include "opcodes.hpp"
+#include "stack.hpp"
 
 Decoded decode(Byte op) {
     return {static_cast<Byte>((op >> 4) & 0x0F), static_cast<Byte>(op & 0x0F)};
@@ -36,6 +37,14 @@ std::uint16_t instr_size(Byte op) {
     case Op::Inc:
     case Op::Dec:
     case Op::Cmp:
+    case Op::Mul:
+    case Op::PushA:
+    case Op::PopA:
+    case Op::PushB:
+    case Op::PopB:
+    case Op::Ret:
+    case Op::PushH:
+    case Op::PopH:
     case Op::MovAB:
     case Op::MovBA:
     case Op::LoadAH:
@@ -62,6 +71,7 @@ std::uint16_t instr_size(Byte op) {
     case Op::Jnc:
     case Op::Jg:
     case Op::Jl:
+    case Op::Call:
         return 3; // opcode, then a 16-bit operand low byte first
     default:
         return 0; // no ISA row (yet): the first place an unknown opcode is caught
@@ -120,6 +130,24 @@ static std::string mnemonic(Op op, Byte imm8, std::uint16_t w16) {
         return "DEC A";
     case Op::Cmp:
         return "CMP A, B";
+    case Op::Mul:
+        return "MUL A, B";
+    case Op::PushA:
+        return "PUSH A";
+    case Op::PopA:
+        return "POP A";
+    case Op::PushB:
+        return "PUSH B";
+    case Op::PopB:
+        return "POP B";
+    case Op::Call:
+        return "CALL " + hex(w16, 4);
+    case Op::Ret:
+        return "RET";
+    case Op::PushH:
+        return "PUSH H";
+    case Op::PopH:
+        return "POP H";
     case Op::LoadiA:
         return "LOADI A, " + hex(imm8, 2);
     case Op::LoadiB:
@@ -206,7 +234,27 @@ std::uint16_t data_address(const CPU& cpu) {
     fetch(*cpu.mem, cpu.pc, ins);
     if (ins.op == Op::LoadAH || ins.op == Op::StoreHA)
         return cpu.h;
+    std::uint16_t target = 0;
+    if (ins.op == Op::Ret && peek16(cpu, target))
+        return target;
     return ins.w16;
+}
+
+std::uint16_t stack_bytes(const CPU& cpu) {
+    switch (static_cast<Op>(mem_get(*cpu.mem, cpu.pc))) {
+    case Op::PushA:
+    case Op::PopA:
+    case Op::PushB:
+    case Op::PopB:
+        return 1;
+    case Op::Call:
+    case Op::Ret:
+    case Op::PushH:
+    case Op::PopH:
+        return 2;
+    default:
+        return 0;
+    }
 }
 
 // Every access the GUEST makes to a byte it names by address goes through
@@ -253,7 +301,9 @@ static void print_flags(const Flags& f) {
     std::cout << "Z=" << f.z << " N=" << f.n << " C=" << f.c;
 }
 
-// AAAA  OP B1 B2  MNEMONIC          -> A=nnn  B=nnn  H=0xhhhh  Z=z N=n C=c
+// AAAA  OP B1 B2  MNEMONIC          -> A=nnn  B=nnn  H=0xhhhh  SP=0xssss  Z=z N=n C=c  top: t0 t1
+// `top:` (Lab 7) is the two newest stack bytes, the newest first, when the
+// stack is not empty: after a CALL from 0x0002 it reads "top: 00 05", 0x0005.
 static void print_trace(const CPU& cpu, const Instruction& ins, const std::string& text) {
     guest_end_line(); // OUT may have left the line open
     std::cout << std::hex << std::setfill('0') << std::setw(4) << ins.at << ' ';
@@ -266,9 +316,12 @@ static void print_trace(const CPU& cpu, const Instruction& ins, const std::strin
     std::cout << std::dec << std::setfill(' ') << "  " << std::left << std::setw(18) << text
               << std::right << "-> A=" << std::setw(3) << static_cast<int>(cpu.a)
               << "  B=" << std::setw(3) << static_cast<int>(cpu.b) << "  H=0x" << std::hex
-              << std::setfill('0') << std::setw(4) << cpu.h << std::dec << std::setfill(' ')
-              << "  ";
+              << std::setfill('0') << std::setw(4) << cpu.h << "  SP=0x" << std::setw(4)
+              << stack_sp(cpu.stack) << std::dec << std::setfill(' ') << "  ";
     print_flags(cpu.f);
+    Byte top = 0;
+    for (std::size_t i = 0; i < 2 && stack_peek(cpu, i, top); ++i)
+        std::cout << (i == 0 ? "  top: " : " ") << hex(top, 2).substr(2);
     std::cout << '\n';
 }
 
@@ -285,6 +338,7 @@ StepResult step(CPU& cpu, bool trace) {
     const Decoded d = decode(ins.bytes[0]);
     Byte v = 0;
     std::uint16_t block = 0; // ALLOC: where the new block starts
+    std::uint16_t ret = 0;   // CALL: the return address; RET: where it goes
     bool flag = false;       // ALLOC: the block was reused; FREE: it was the top one
     HeapResult hr = HeapResult::ok;
     // Where PC goes after this instruction: the next one, unless a jump is taken.
@@ -292,8 +346,8 @@ StepResult step(CPU& cpu, bool trace) {
 
     // Every error path returns before anything is changed. Each known opcode
     // has its own case; every default is the second place an unknown opcode
-    // is caught (after instr_size). The 0x0_, 0x2_, 0x3_ rows and JG/JL never
-    // touch the flags (ISA §3); the 0x4_, 0x6_ rows and FREE touch only C.
+    // is caught (after instr_size). The 0x0_, 0x2_, 0x3_, 0x5_ rows and JG/JL
+    // never touch the flags (ISA §3); the 0x4_, 0x6_ rows and FREE touch only C.
     switch (d.group) {
     case 0x0:
         switch (ins.op) {
@@ -357,6 +411,9 @@ StepResult step(CPU& cpu, bool trace) {
             break;
         case Op::Cmp:
             alu_sub(cpu.a, cpu.b, cpu.f); // only the flags; A keeps its value
+            break;
+        case Op::Mul:
+            cpu.a = alu_mul(cpu.a, cpu.b, cpu.f);
             break;
         default:
             return StepResult::bad_opcode;
@@ -468,6 +525,61 @@ StepResult step(CPU& cpu, bool trace) {
             return StepResult::bad_opcode;
         }
         break;
+    case 0x5:
+        // The stack (stack.hpp). This file says WHAT each instruction does;
+        // where the bytes are kept is the stack's business. A refused push
+        // or pop has changed nothing. The flags are never touched.
+        switch (ins.op) {
+        case Op::PushA:
+            if (!push(cpu, cpu.a))
+                return StepResult::stack_overflow;
+            break;
+        case Op::PopA:
+            if (!pop(cpu, v))
+                return StepResult::stack_underflow;
+            cpu.a = v;
+            break;
+        case Op::PushB:
+            if (!push(cpu, cpu.b))
+                return StepResult::stack_overflow;
+            break;
+        case Op::PopB:
+            if (!pop(cpu, v))
+                return StepResult::stack_underflow;
+            cpu.b = v;
+            break;
+        case Op::Call:
+            // ISA §6: the return address is P + 3, the instruction AFTER this
+            // CALL (`next`, before the jump changes it), low byte first. A
+            // target outside the box is refused before the stack is touched.
+            ret = next;
+            if (!jump_to(w16, next))
+                return StepResult::bad_address;
+            if (!push16(cpu, ret))
+                return StepResult::stack_overflow;
+            break;
+        case Op::Ret:
+            // Look first, take after: an address outside the box is refused
+            // with SP where it was.
+            if (!peek16(cpu, ret))
+                return StepResult::stack_underflow;
+            if (!jump_to(ret, next))
+                return StepResult::bad_address;
+            pop16(cpu, ret);
+            break;
+        case Op::PushH:
+            if (!push16(cpu, cpu.h))
+                return StepResult::stack_overflow;
+            break;
+        case Op::PopH:
+            // Any 16 bits may come back: holding a bad address is fine, using it is not.
+            if (!pop16(cpu, cpu.h))
+                return StepResult::stack_underflow;
+            break;
+        default:
+            return StepResult::bad_opcode;
+        }
+        break;
     case 0x6:
         // The guest heap (heap.cpp). Not fitting is no error of the step:
         // C = 1 and H stays. Z, N, A and B are never touched.
@@ -527,7 +639,8 @@ void dump_regs(const CPU& cpu) {
     std::cout << "PC=0x" << std::hex << std::setfill('0') << std::setw(4) << cpu.pc << std::dec
               << std::setfill(' ') << "  A=" << static_cast<int>(cpu.a)
               << "  B=" << static_cast<int>(cpu.b) << "  H=0x" << std::hex << std::setfill('0')
-              << std::setw(4) << cpu.h << std::dec << std::setfill(' ') << "  ";
+              << std::setw(4) << cpu.h << "  SP=0x" << std::setw(4) << stack_sp(cpu.stack)
+              << std::dec << std::setfill(' ') << "  ";
     print_flags(cpu.f);
     std::cout << '\n';
 }

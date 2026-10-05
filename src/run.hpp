@@ -7,6 +7,10 @@
 // Counted per `run` command; the next `run` gets the same budget again.
 const unsigned long RUN_STEP_LIMIT = 100000;
 
+// What `run` prints per step: nothing (the guest's output only), a trace
+// line for every step like `step`, or (Lab 7) lines for CALL and RET only.
+enum class Trace { off, on, calls };
+
 enum class RunStop {
     halted,     // HALT executed (counted in steps)
     error,      // a step was refused; RunResult::error says why
@@ -21,8 +25,8 @@ struct RunResult {
 };
 
 // Step from PC until HALT, an error, the breakpoint (a guest address, < 0
-// for none) or `limit` steps. With `trace`, one line per step. The
+// for none) or `limit` steps. `trace` picks which steps print a line. The
 // breakpoint is not checked before the first step, so `run` from a
 // breakpoint goes on, like "continue" in a debugger. `anim` passes a smaller
 // limit: one frame's worth of steps (Lab 5).
-RunResult run(CPU& cpu, bool trace, long breakpoint, unsigned long limit = RUN_STEP_LIMIT);
+RunResult run(CPU& cpu, Trace trace, long breakpoint, unsigned long limit = RUN_STEP_LIMIT);

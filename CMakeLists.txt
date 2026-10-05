@@ -5,6 +5,20 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Lab 7: how the guest stack keeps its bytes is chosen here, not in the
+# source. stack.hpp, stack.cpp and cpu.cpp are the same for both; only one
+# of the two files below is compiled in.
+#   cmake -S . -B build/list -DCMAKE_BUILD_TYPE=Debug -DEMBER_STACK=list
+set(EMBER_STACK "array" CACHE STRING "Representation of the guest stack: array or list")
+set_property(CACHE EMBER_STACK PROPERTY STRINGS array list)
+if(EMBER_STACK STREQUAL "array")
+    set(EMBER_STACK_SRC src/stack_array.cpp)
+elseif(EMBER_STACK STREQUAL "list")
+    set(EMBER_STACK_SRC src/stack_list.cpp)
+else()
+    message(FATAL_ERROR "EMBER_STACK is array or list, got '${EMBER_STACK}'")
+endif()
+
 add_executable(ember
     src/main.cpp
     src/memory.cpp
@@ -21,6 +35,9 @@ add_executable(ember
     src/sprite.cpp
     src/value.cpp
     src/layout.cpp
+    src/stack.cpp
+    ${EMBER_STACK_SRC}
+    src/messages.cpp
 )
 
 target_compile_options(ember PRIVATE -Wall -Wextra -Werror)
