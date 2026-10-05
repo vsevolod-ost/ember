@@ -130,7 +130,7 @@ int main(int argc, char* argv[]) {
     long breakpoint = -1;     // `b <addr>`: run stops when PC gets there; -1 = none
     Label* labels = nullptr;  // Lab 8: the labels of the last `asm`, for disasm and expr
 
-    std::cout << "ember 0.1 - 4096 bytes of memory you can see. Type `help`.\n";
+    std::cout << "ember 1.0.0 - 4096 bytes of memory you can see. Type `help`.\n";
 
     std::string line;
     while (true) {
