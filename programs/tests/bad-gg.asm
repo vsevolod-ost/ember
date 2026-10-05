@@ -1,0 +1,3 @@
+NOP
+NOP
+LOADI A, 0xGG

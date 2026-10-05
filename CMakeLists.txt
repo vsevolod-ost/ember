@@ -38,7 +38,19 @@ add_executable(ember
     src/stack.cpp
     ${EMBER_STACK_SRC}
     src/messages.cpp
+    src/isa.cpp
+    src/asm/token.cpp
+    src/asm/lexer.cpp
+    src/asm/label.cpp
+    src/asm/expr.cpp
+    src/asm/macro.cpp
+    src/asm/assembler.cpp
+    src/asm/disasm.cpp
+    src/asm/load.cpp
 )
+
+# Lab 8: src/asm/*.cpp include "memory.hpp", main.cpp includes "asm/lexer.hpp".
+target_include_directories(ember PRIVATE src)
 
 target_compile_options(ember PRIVATE -Wall -Wextra -Werror)
 

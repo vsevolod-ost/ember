@@ -1,0 +1,2 @@
+NOP
+LOADI A, 0x

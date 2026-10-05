@@ -13,12 +13,18 @@
 #include <string>
 
 #include "alu.hpp"
+#include "asm/assembler.hpp"
+#include "asm/disasm.hpp"
+#include "asm/expr.hpp"
+#include "asm/lexer.hpp"
+#include "asm/load.hpp"
 #include "cpu.hpp"
 #include "display.hpp"
 #include "dump.hpp"
 #include "guest_io.hpp"
 #include "heap.hpp"
 #include "hexdump.hpp"
+#include "isa.hpp"
 #include "layout.hpp"
 #include "memory.hpp"
 #include "messages.hpp"
@@ -106,13 +112,23 @@ static void print_sprite(int i, const Memory& mem, const Sprite sprites[]) {
         print_value(v, mem, sprites);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Lab 8: `./ember program.asm` assembles the file and runs it; with no
+    // argument the REPL below opens, as it always did.
+    if (argc == 2)
+        return run_file(argv[1]);
+    if (argc > 2) {
+        std::cout << "usage: ember [program.asm]\n";
+        return 2;
+    }
+
     Memory mem; // 4096 bytes, on the stack, zeroed by the {} in memory.hpp
     CPU cpu{&mem};
     // Lab 6: eight host records; the {} makes every field 0, so all are dead.
     Sprite sprites[SPRITE_COUNT]{};
     Trace trace = Trace::off; // `trace on|calls`: run prints a line per step / per CALL and RET
     long breakpoint = -1;     // `b <addr>`: run stops when PC gets there; -1 = none
+    Label* labels = nullptr;  // Lab 8: the labels of the last `asm`, for disasm and expr
 
     std::cout << "ember 0.1 - 4096 bytes of memory you can see. Type `help`.\n";
 
@@ -300,22 +316,9 @@ int main() {
             report(step(cpu, true), cpu);
         } else if (cmd == "run") {
             // Quiet unless `trace on`: the guest's output, then how many
-            // instructions ran (HALT included). The loop is in run.cpp.
-            const RunResult r = run(cpu, trace, breakpoint);
-            guest_end_line();
-            if (r.why == RunStop::halted) {
-                std::cout << "halted after " << r.steps << " steps\n";
-            } else if (r.why == RunStop::error) {
-                report(r.error, cpu);
-            } else if (r.why == RunStop::breakpoint) {
-                std::cout << "breakpoint at " << hex(cpu.pc, 4) << '\n';
-            } else {
-                std::cout << "step limit " << RUN_STEP_LIMIT << " reached at " << hex(cpu.pc, 4)
-                          << '\n';
-            }
-            // Already halted before this run: the refusal says it all.
-            if (r.why != RunStop::halted && r.error != StepResult::halted)
-                std::cout << "stopped after " << r.steps << " steps\n";
+            // instructions ran (HALT included). The loop is in run.cpp, the
+            // lines in messages.cpp (shared with the command line, Lab 8).
+            report_run(run(cpu, trace, breakpoint), cpu);
         } else if (cmd == "trace") {
             std::string v;
             words >> v;
@@ -647,11 +650,121 @@ int main() {
             } else {
                 print_value(v, mem, sprites);
             }
+        } else if (cmd == "lex") {
+            // The given lexer on a whole file: one token per line, or the error.
+            std::string path, extra, src, error;
+            if (!(words >> path) || words >> extra) {
+                std::cout << "usage: lex <file.asm>\n";
+            } else if (!read_file(path, src)) {
+                std::cout << "cannot open " << path << '\n';
+            } else if (Token* tokens = lex(src, error)) {
+                print_tokens(tokens);
+                destroy(tokens);
+            } else {
+                std::cout << error << '\n'; // lex has already freed the list
+            }
+        } else if (cmd == "asm") {
+            // Assemble, print the listing, load the bytes, then PC = 0 with
+            // an empty stack and heap (load.cpp). A, B, H and the rest of
+            // memory stay: `set 1 10` after it changes the program's n.
+            std::string path, mode, extra, src, error;
+            words >> path >> mode;
+            if (path.empty() || (!mode.empty() && mode != "onepass") || words >> extra) {
+                std::cout << "usage: asm <file.asm> [onepass]\n";
+            } else if (!read_file(path, src)) {
+                std::cout << "cannot open " << path << '\n';
+            } else {
+                Program* p = new Program{}; // 20 KB: on the heap
+                if (!assemble(src, mode.empty() ? AsmMode::two_pass : AsmMode::one_pass, *p,
+                              error)) {
+                    std::cout << error << "; nothing loaded\n";
+                } else {
+                    print_listing(*p, src);
+                    load_program(*p, mem);
+                    start_program(cpu);
+                    labels_destroy(labels); // the labels are this program's now
+                    labels = p->labels;
+                    p->labels = nullptr;
+                    program_free(*p);
+                }
+                delete p;
+            }
+        } else if (cmd == "disasm") {
+            // Ranges [lo, hi) like find; several in one go come out as one
+            // source text, with .org between them, so no byte may be in two.
+            const std::size_t MAX_RANGES = 8;
+            std::uint16_t lo[MAX_RANGES], hi[MAX_RANGES];
+            std::size_t n = 0;
+            bool bad = false, outside = false, overlap = false;
+            std::string l, h;
+            while (!bad && words >> l) {
+                long from = 0, to = 0;
+                if (n == MAX_RANGES || !(words >> h) || !parse_number(l, from) ||
+                    !parse_number(h, to)) {
+                    bad = true;
+                } else if (from < 0 || from > to || static_cast<std::size_t>(to) > MEM_SIZE) {
+                    outside = true;
+                } else {
+                    lo[n] = static_cast<std::uint16_t>(from);
+                    hi[n] = static_cast<std::uint16_t>(to);
+                    for (std::size_t i = 0; i < n; ++i)
+                        if (lo[i] < hi[n] && lo[n] < hi[i])
+                            overlap = true;
+                    ++n;
+                }
+            }
+            if (bad || (n == 0 && !outside))
+                std::cout << "usage: disasm <lo> <hi> [<lo> <hi> ...] (at most " << MAX_RANGES
+                          << " ranges)\n";
+            else if (outside)
+                std::cout << "range must be 0 <= lo <= hi <= " << MEM_SIZE << '\n';
+            else if (overlap)
+                std::cout << "ranges must not overlap\n";
+            else
+                disasm_ranges(mem, lo, hi, n, labels);
+        } else if (cmd == "expr") {
+            // The rest of the line, through the lexer and the expression
+            // parser of the assembler: the tree, then its value.
+            std::string text, error;
+            std::getline(words, text);
+            Token* tokens = lex(text, error);
+            const Token* t = tokens;
+            Expr* e = nullptr;
+            long v = 0;
+            if (!tokens) {
+                std::cout << error << '\n';
+            } else if (t->kind == Token::Kind::Eof) {
+                std::cout << "usage: expr <expression>\n";
+            } else if (!(e = parse_expr(t, error))) {
+                std::cout << error << '\n';
+            } else if (t->kind != Token::Kind::Eof) {
+                std::cout << "line 1: unexpected " << token_word(t) << " after " << expr_text(e)
+                          << '\n';
+            } else {
+                expr_print(e);
+                if (expr_eval(e, labels, v, error) != EvalResult::ok)
+                    std::cout << error << '\n';
+                else if (v < 0)
+                    std::cout << "= " << v << '\n';
+                else
+                    std::cout << "= " << v << "  (" << hex(static_cast<unsigned>(v), 4) << ")\n";
+            }
+            expr_destroy(e);
+            destroy(tokens);
+        } else if (cmd == "isa") {
+            // The one table step() and the assembler read (isa.cpp).
+            std::size_t count = 0;
+            const IsaRow* rows = isa_rows(count);
+            for (std::size_t i = 0; i < count; ++i)
+                std::cout << hex(static_cast<unsigned>(rows[i].op), 2) << "  " << row_size(rows[i])
+                          << "  " << rows[i].text << '\n';
+            std::cout << count << " rows\n";
         } else {
             std::cout << "unknown command: " << cmd << " (try `help`)\n";
         }
     }
 
     stack_clear(cpu.stack); // the list build gives its nodes back
-    return 0;               // 0 means "success" to the operating system
+    labels_destroy(labels);
+    return 0; // 0 means "success" to the operating system
 }

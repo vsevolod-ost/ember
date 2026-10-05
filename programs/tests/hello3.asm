@@ -1,0 +1,3 @@
+LOADI A, 65
+OUT
+HALT

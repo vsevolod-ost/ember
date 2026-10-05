@@ -6562,3 +6562,1595 @@ ember>
 ```
 
 - `PUSH`/`CALL` пишуть, а `POP`/`RET` (у збірці «масив») читають байти стека через ті самі `guest_write`/`guest_read`, що й `STORE`/`LOAD`. Регіон стека не перетинається з `PORT_OUT`/`TICKS`, але правило одне для всіх звертань гостя.
+
+---
+
+# Lab 08 — Дайте їй мову: лексер, списки й програми, які можна читати
+
+Тепер програму для `ember` можна написати текстом. Шлях такий: файл `.asm` → лексер → список токенів → асемблер → байти в пам'яті → `run`.
+
+Нові команди REPL і командний рядок:
+
+| Команда | Що робить |
+|---|---|
+| `lex <file.asm>` | прогнати лексер по файлу й надрукувати по токену на рядок: номер рядка джерела, вид, у дужках текст; у кінці — скільки токенів. Помилка — лише `line N: …` |
+| `asm <file.asm> [onepass]` | зібрати файл. Друкує лістинг (адреса, байти, рядок джерела), мітки й `assembled N bytes: …`, потім завантажує байти. Після цього `PC = 0x0000`, `SP = 0x0fff`, стек і купа порожні; `A`, `B`, `H`, прапорці й решта пам'яті не змінюються. На помилці — `line N: …; nothing loaded`, і нічого не змінено. `onepass` збирає за один прохід із чергою відкладених операндів |
+| `disasm <lo> <hi> [<lo> <hi> …]` | байти `[lo, hi)` назад у текст, з мітками останнього `asm`. До 8 діапазонів, які не перетинаються |
+| `expr <вираз>` | розібрати вираз операнда й надрукувати дерево (вузол на рядок) і значення |
+| `isa` | таблиця інструкцій, з якої читають і `step()`, і асемблер: опкод, розмір, мнемоніка |
+| `./build/ember <file.asm>` | зібрати файл (два проходи) у свіжу машину й тихо виконати. Друкує вивід гостя й `halted after N steps`, код виходу 0. Помилка збирання — `<file>: line N: …`, код 1, нічого не виконується. Відмова кроку чи ліміт кроків — те саме повідомлення, що й у `run`, код 1. Більше одного аргументу — `usage: …`, код 2. Без аргументу, як і раніше, відкривається REPL |
+
+Нові файли:
+
+| Файл | Що в ньому |
+|---|---|
+| `src/isa.hpp/.cpp` | таблиця інструкцій ISA §5 в одному місці: опкод і текст колонки «Мнемоніка» (`LOAD A, [addr16]`); розмір виводиться з плейсхолдера |
+| `src/asm/token.hpp/.cpp` | вузол `Token` і `destroy` (дано); `push_back`, `cut`, `splice`, друк токенів, значення літералів |
+| `src/asm/lexer.hpp/.cpp` | лексер (дано, крім `number()`) плюс гілки для директив, рядків, символів і операторів |
+| `src/asm/expr.hpp/.cpp` | вирази операндів: дерево `Expr`, рекурсивний спуск, обчислення |
+| `src/asm/macro.hpp/.cpp` | `.define` — прохід 0 над списком токенів |
+| `src/asm/label.hpp/.cpp` | мітки, теж зв'язний список |
+| `src/asm/assembler.hpp/.cpp` | два проходи (або один із чергою), лістинг, завантаження в пам'ять |
+| `src/asm/disasm.hpp/.cpp` | дизасемблер |
+| `src/asm/load.hpp/.cpp` | читання файлу, командний рядок, стартовий стан після `asm` |
+| `programs/*.asm` | `hello`, `search`, `fib`, `bounce`; `fact` — лістинг ISA §6 текстом |
+| `programs/tests/*.asm` | маленькі вхідні файли для перевірок цього розділу; вміст кожного показано перед транскриптом |
+
+`main.cpp` отримав гілки `else if` для нових команд і сигнатуру `int main(int argc, char* argv[])` з однією гілкою для командного рядка. `instr_size()` і `mnemonic()` у `cpu.cpp` тепер беруть розмір і текст із `isa.cpp`, `switch` у `step()` не змінився. Вивід старих команд від цього не змінився, перевірка — у кінці M2.
+
+## M1 — лексер
+
+**Що дано, а що моє.** `lexer.cpp` — це блок лаби «ДАНО, крім number()», вставлений дослівно: `struct Lexer`, `emit`, `fail`, `destroy` і цикл `lex()` з українськими коментарями. `token.hpp` — вузол із теорії §3 плюс `void destroy(Token* head);`, `lexer.hpp` — оголошення `lex()`. `clang-format` змінив у даному коді лише пробіли й переноси. Моє — тіло `number()`. Для Advanced (вирази, `.define`, рядки) у `enum class Kind` **після** `Eof` дописано `Directive, String, Char, Plus, Minus, Star, LParen, RParen`. У ланцюжок `lex()` перед останнім `else` додано гілки для `.слово`, `"…"`, `'c'` і `+ - * ( )`. Жоден даний рядок не видалено.
+
+`number()`. Курсор стоїть на цифрі. Після `0x`/`0X` має бути хоча б одна шістнадцяткова цифра, після `0b`/`0B` — хоча б одна з `01`, інакше читаються десяткові цифри. Одразу після цифр не може стояти літера, цифра чи `_`: `12ab`, `0xGG` і `0b102` — це одна зіпсована лексема, а не «число, а за ним слово». Токен несе текст так, як його написано (`Number(0x41)`). Чи влазить значення в байт, вирішує асемблер. `0123` — це десяткове 123, вісімкових чисел немає.
+
+```cpp
+// ВАШЕ (Lab 8, M1). Курсор lx.i стоїть на цифрі.
+// З'їсти число — `0x` і шістнадцяткові цифри, `0b` і двійкові, або десяткові —
+// і видати його: emit(lx, Token::Kind::Number, текст_числа).
+// Зіпсоване число — `0xGG`, `0x` без жодної цифри, `12ab` — це
+// `return fail(lx, "bad number");`, а не тихий нуль.
+static bool number(Lexer& lx) {
+    const std::string& s = lx.src;
+    const std::size_t start = lx.i;
+    std::size_t digits = 0; // after the 0x/0b prefix, if any
+    const char kind = s[lx.i] == '0' && lx.i + 1 < s.size() ? s[lx.i + 1] : '\0';
+    if (kind == 'x' || kind == 'X') {
+        lx.i += 2;
+        for (; lx.i < s.size() && std::isxdigit((unsigned char)s[lx.i]); ++lx.i)
+            ++digits;
+    } else if (kind == 'b' || kind == 'B') {
+        lx.i += 2;
+        for (; lx.i < s.size() && (s[lx.i] == '0' || s[lx.i] == '1'); ++lx.i)
+            ++digits;
+    } else {
+        for (; lx.i < s.size() && std::isdigit((unsigned char)s[lx.i]); ++lx.i)
+            ++digits; // 0123 is decimal 123: there is no octal
+    }
+    // `0x` with no digit, and a number glued to letters (`0xGG`, `12ab`,
+    // `0b102`): the whole lexeme is wrong, not "a number and then a word".
+    if (digits == 0 ||
+        (lx.i < s.size() && (std::isalnum((unsigned char)s[lx.i]) || s[lx.i] == '_')))
+        return fail(lx, "bad number");
+    // The text as written; how big it is is the assembler's question.
+    emit(lx, Token::Kind::Number, s.substr(start, lx.i - start));
+    return true;
+}
+```
+
+`lex programs/hello.asm` друкує по токену на рядок: номер рядка, вид і в дужках текст (для пунктуації — лише вид). Файл:
+
+```asm
+; hello.asm — OUTS рядка, зібраного в регіон даних (0x800)
+        OUTS msg
+        HALT
+
+        .org 0x800
+msg:    .string "Hello, ember!\n"
+```
+
+```txt
+ember> lex programs/hello.asm
+   1  Newline
+   2  Ident(OUTS)
+   2  Ident(msg)
+   2  Newline
+   3  Ident(HALT)
+   3  Newline
+   4  Newline
+   5  Directive(.org)
+   5  Number(0x800)
+   5  Newline
+   6  Ident(msg)
+   6  Colon
+   6  Directive(.string)
+   6  String("Hello, ember!\n")
+   6  Newline
+   7  Eof
+16 tokens
+ember>
+```
+
+Рядок 1 — коментар: від `;` до кінця рядка лексер нічого не видає, тож лишається тільки `Newline`. `Newline` — теж токен: саме по ньому асемблер ділить програму на рядки.
+
+Перевірка з CHECKS, `programs/tests/loop.asm`:
+
+```asm
+loop: JMP loop
+```
+
+```txt
+ember> lex programs/tests/loop.asm
+   1  Ident(loop)
+   1  Colon
+   1  Ident(JMP)
+   1  Ident(loop)
+   1  Newline
+   2  Eof
+6 tokens
+ember>
+```
+
+Відмови. Кожна — з номером рядка, тихого нуля не буває. Файли `bad-gg.asm`, `bad-0x.asm`, `bad-12ab.asm`, `bad-at.asm` з `programs/tests/`:
+
+```asm
+NOP
+NOP
+LOADI A, 0xGG
+```
+
+```asm
+NOP
+LOADI A, 0x
+```
+
+```asm
+LOADI A, 12ab
+```
+
+```asm
+HALT
+@start
+```
+
+```txt
+ember> lex programs/tests/bad-gg.asm
+line 3: bad number
+ember> lex programs/tests/bad-0x.asm
+line 2: bad number
+ember> lex programs/tests/bad-12ab.asm
+line 1: bad number
+ember> lex programs/tests/bad-at.asm
+line 2: unexpected character '@'
+ember>
+```
+
+`@` відхиляє даний код (останній `else`), зіпсовані числа — мій `number()` через даний `fail`. На першій помилці лексер зупиняється (`break` у даному циклі) і сам звільняє вже побудований список.
+
+**Список токенів як тип.** Скільки токенів у файлі, наперед невідомо, тому токени лежать в однозв'язному списку з `head` і `tail`. Інтерфейс — `token.hpp`:
+
+```cpp
+struct Token {
+    enum class Kind {
+        Ident,
+        Number,
+        Comma,
+        Colon,
+        LBracket,
+        RBracket,
+        Newline,
+        Eof,
+        // Lab 8 Advanced
+        Directive, // .org .byte .word .string .define
+        String,    // "Hello\n", the text as written, quotes included
+        Char,      // '-', the text as written, quotes included
+        Plus,
+        Minus,
+        Star,
+        LParen,
+        RParen
+    };
+    Kind kind;
+    std::string text; // або зріз (вказівник + довжина) у вихідний текст
+    int line;
+    Token* next; // nullptr у кінці
+};
+
+void destroy(Token* head);
+
+// The rest of the list as an abstract type (Notes 08 §3: push_back, walk,
+// destroy). The walk is `for (const Token* t = head; t; t = t->next)`. The
+// given lexer has its own push_back (emit, kept as given); everything else
+// that builds or edits a token list (pass 0, macro.cpp) uses these.
+
+// A new node {kind, text, line} at the end of [head, tail].
+void push_back(Token*& head, Token*& tail, Token::Kind kind, const std::string& text, int line);
+// `*link` is the pointer that points at a node: head, or the previous
+// node's next. Unlink that node and the ones after it up to and including
+// `last`, and free them.
+void cut(Token** link, Token* last);
+// Put the list [first, last] where `*link` points, before the node that was
+// there.
+void splice(Token** link, Token* first, Token* last);
+```
+
+- **`push_back`** — у лексері це даний `emit` (через `tail`, тож без проходу по списку). Для всього іншого, хто будує список, є `push_back` з `token.cpp`: прохід 0 копіює ним тіла `.define`.
+- **Обхід** — `for (const Token* t = head; t; t = t->next)`: так друкує `lex` і так читає асемблер.
+- **`destroy`** — даний: `delete` кожного вузла, причому `next` прочитано **до** `delete`.
+- **`cut`/`splice`** — вирізати шматок списку й вставити інший на його місце. Так прохід 0 замінює ім'я макросу копією його тіла.
+
+Хто звільняє список: `lex()` — на помилці (даний код), команда `lex` — після друку, асемблер — після другого проходу, і на успіху, і на помилці. Що санітайзери мовчать на всіх цих шляхах, перевіряє скрипт у кінці M2.
+
+## M2 — асемблер
+
+Граматика (EBNF, як у лабі; на місці `number` тепер `expr` — вирази з Advanced):
+
+```txt
+program     := { line }
+line        := { ident ':' } [ instruction | directive ] [ comment ] ( newline | eof )
+instruction := mnemonic [ operand { ',' operand } ]     ; форма — рядок ISA §5
+operand     := register | expr | '[' ( expr | 'H' ) ']'
+register    := 'A' | 'B' | 'H'
+directive   := '.org' expr | '.byte' item { ',' item } | '.word' expr { ',' expr }
+             | '.string' string | '.define' ident tokens...
+item        := expr | string
+expr        := term { ( '+' | '-' ) term }
+term        := unary { '*' unary }
+unary       := '-' unary | atom
+atom        := number | char | ident | '(' expr ')'
+```
+
+Мнемоніки й регістри пишуться великими літерами, як в ISA. У міток регістр має значення. На одному рядку може бути кілька міток: `x: y: HALT` — дві мітки на одну адресу. Мітка на окремому рядку — це адреса наступного байта.
+
+Директиви — не опкоди, у пам'ять самі не потрапляють:
+
+| Директива | Що робить |
+|---|---|
+| `.org expr` | наступний байт піде на адресу `expr` (0..0xFFF); значення має бути відоме вже в першому проході |
+| `.byte item, …` | байти: число −128..255 (від'ємне — у доповнювальному коді, `-1` → `ff`) або рядок `"…"` (його байти, без нуля) |
+| `.word expr, …` | 16-бітні слова, молодший байт першим |
+| `.string "…"` | байти рядка і завершальний `0` — рядок для `OUTS` |
+| `.define NAME токени…` | макрос: далі кожне `NAME` замінюється цими токенами (Advanced, нижче) |
+
+У `"…"` і `'…'` працюють екрановані символи `\n \t \0 \\ \" \'`. Діапазони операндів: `imm8` — −128..255, `imm16` — −32768..65535, `addr16` — 0..0xFFF. Адресу поза коробкою асемблер ловить під час збирання, а не під час виконання.
+
+### Два проходи
+
+`programs/tests/forward.asm` (Notes §4):
+
+```asm
+       JMP done    ; ще не знаємо адресу
+       NOP
+done:  HALT
+```
+
+```txt
+ember> asm programs/tests/forward.asm
+0000  30 04 00         JMP done    ; ще не знаємо адресу
+0003  01               NOP
+0004  00        done:  HALT
+labels: done=0x0004
+assembled 5 bytes: 0x0000-0x0004; PC=0x0000
+ember> dump 0 8
+0000  30 04 00 01 00 00 00 00 00 00 00 00 00 00 00 00  |0...............|
+ember>
+```
+
+На рядку 1 адреса `done` ще невідома. **Прохід 1** нічого не обчислює, лише рахує: кожна мітка отримує поточну адресу, кожна інструкція додає свій розмір із таблиці. Від значення операнда розмір не залежить: `JMP addr16` — завжди 3 байти. `JMP` займає `0000`–`0002`, `NOP` — `0003`, тож `done = 0x0004`. **Прохід 2** йде тими самими рядками ще раз, тепер із відомими мітками, і пише байти `30 04 00`. Обидва проходи розбирають рядок однією функцією (`assemble_line`). Різниця лише в тому, що вона робить з операндом: резервує байти або записує значення. Тому в розмірах проходи розійтись не можуть.
+
+`asm` збирає в буфер `Program` на хості й копіює байти в пам'ять лише після успіху. Копіює через `mem_set`, як хост, тож порт виводу нічого не друкує. Далі ставиться стартовий стан програми з ISA §1: `PC = 0x0000`, `SP = 0x0fff` з порожнім стеком, порожня купа. Якщо попередня програма зупинилась посеред `CALL` (точка зупину, переповнення стека), нова від цього не постраждає. `A`, `B`, `H`, прапорці й решта пам'яті лишаються, тому `set 1 10` після `asm` змінює аргумент `fib` (M3).
+
+### Одна таблиця інструкцій
+
+Асемблер і `step()` беруть розміри з одного місця — `src/isa.cpp`. Рядок таблиці — це опкод і текст колонки «Мнемоніка» ISA, літера в літеру. Розмір окремо не записаний, а виводиться з плейсхолдера: без плейсхолдера — 1 байт, `imm8` — 2, `imm16`/`addr16` — 3.
+
+```cpp
+enum class Operand : std::uint8_t { none, imm8, imm16, addr16 };
+
+struct IsaRow {
+    Op op;
+    const char* text; // the ISA's mnemonic column, word for word
+};
+
+static const IsaRow ROWS[] = {
+    // 0x0_ — control and output
+    {Op::Halt, "HALT"},
+    {Op::Nop, "NOP"},
+    {Op::Out, "OUT"},
+    {Op::Outn, "OUTN"},
+    {Op::Outs, "OUTS addr16"},
+
+    // 0x7_ — own extensions (Lab 4: JG/JL, Lab 6: FREE)
+    {Op::Jg, "JG addr16"},
+    {Op::Jl, "JL addr16"},
+    {Op::Free, "FREE"},
+};
+
+std::uint16_t row_size(const IsaRow& row) {
+    switch (row_operand(row)) {
+    case Operand::none:
+        return 1;
+    case Operand::imm8:
+        return 2; // opcode, imm8
+    case Operand::imm16:
+    case Operand::addr16:
+        return 3; // opcode, then a 16-bit operand low byte first
+    }
+    return 0;
+}
+
+std::uint16_t instr_size(Byte op) {
+    const IsaRow* row = isa_row(op);
+    // No row: 0, the first place an unknown opcode is caught.
+    return row ? row_size(*row) : 0;
+}
+```
+
+`step()` викликає `instr_size()`. Трасування й `disasm` викликають `row_text()`, яка підставляє операнд замість плейсхолдера (`0x05`). Асемблер лексить текст кожного рядка таблиці тим самим `lex()` і отримує форму рядка: `LOAD A, [addr16]` → `Ident(LOAD) Ident(A) Comma LBracket Ident(addr16) RBracket`. Рядок програми збігається з формою, якщо збігаються всі токени, а на місці плейсхолдера стоїть вираз. Своєї копії розмірів чи синтаксису в асемблера немає, тож помилка в тексті таблиці була б помилкою самої мови.
+
+`isa` — 49 рядків ISA (разом з *opt*) і три власні:
+
+```txt
+ember> isa
+0x00  1  HALT
+0x01  1  NOP
+0x02  1  OUT
+0x03  1  OUTN
+0x04  3  OUTS addr16
+0x10  1  ADD A, B
+0x11  1  SUB A, B
+0x12  1  AND A, B
+0x13  1  OR A, B
+0x14  1  XOR A, B
+0x15  1  NOT A
+0x16  1  SHL A
+0x17  1  SHR A
+0x18  1  INC A
+0x19  1  DEC A
+0x1a  1  CMP A, B
+0x1b  1  MUL A, B
+0x20  2  LOADI A, imm8
+0x21  2  LOADI B, imm8
+0x22  3  LOAD A, [addr16]
+0x23  3  LOAD B, [addr16]
+0x24  3  STORE [addr16], A
+0x25  3  STORE [addr16], B
+0x26  1  MOV A, B
+0x27  1  MOV B, A
+0x28  3  LOADH H, imm16
+0x29  1  LOAD A, [H]
+0x2a  1  STORE [H], A
+0x2b  1  INCH
+0x2c  1  DECH
+0x2d  1  HLOW
+0x30  3  JMP addr16
+0x31  3  JZ addr16
+0x32  3  JNZ addr16
+0x33  3  JC addr16
+0x34  3  JNC addr16
+0x40  1  CLS
+0x41  1  PLOT
+0x42  1  UNPLOT
+0x43  1  SHOW
+0x50  1  PUSH A
+0x51  1  POP A
+0x52  1  PUSH B
+0x53  1  POP B
+0x54  3  CALL addr16
+0x55  1  RET
+0x56  1  PUSH H
+0x57  1  POP H
+0x60  1  ALLOC
+0x70  3  JG addr16
+0x71  3  JL addr16
+0x72  1  FREE
+52 rows
+ember>
+```
+
+### Повний оберт (CHECKS)
+
+`programs/tests/halt.asm` і `programs/tests/jmp0123.asm`:
+
+```asm
+HALT
+```
+
+```asm
+JMP 0x0123
+```
+
+```txt
+ember> asm programs/tests/halt.asm
+0000  00        HALT
+labels: none
+assembled 1 byte: 0x0000; PC=0x0000
+ember> dump 0 8
+0000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+ember>
+```
+
+```txt
+ember> asm programs/tests/jmp0123.asm
+0000  30 23 01  JMP 0x0123
+labels: none
+assembled 3 bytes: 0x0000-0x0002; PC=0x0000
+ember> dump 0 8
+0000  30 23 01 00 00 00 00 00 00 00 00 00 00 00 00 00  |0#..............|
+ember>
+```
+
+`HALT` — один байт `00`. `JMP 0x0123` — `30 23 01`: опкод, а за ним адреса молодшим байтом уперед.
+
+`hello` з трьох рядків із теорії (рівень Basic), `programs/tests/hello3.asm`:
+
+```asm
+LOADI A, 65
+OUT
+HALT
+```
+
+```txt
+ember> asm programs/tests/hello3.asm
+0000  20 41     LOADI A, 65
+0002  02        OUT
+0003  00        HALT
+labels: none
+assembled 4 bytes: 0x0000-0x0003; PC=0x0000
+ember> run
+A
+halted after 3 steps
+ember>
+```
+
+### `fact` текстом
+
+CHECKS називає це найнадійнішою перевіркою асемблера. `programs/fact.asm` — колонка «текст» лістингу `fact` з ISA §6 дослівно:
+
+```txt
+ember> asm programs/fact.asm
+0000  20 05     LOADI A, 5        ; n = 5
+0002  54 07 00  CALL  fact
+0005  03        OUTN              ; надрукує 120
+0006  00        HALT
+
+                ; fact(n): аргумент в A, результат в A. Псує B.
+0007  21 00     fact:  LOADI B, 0
+0009  1a               CMP   A, B       ; n == 0 ?
+000a  31 1b 00         JZ    base
+000d  21 01            LOADI B, 1
+000f  1a               CMP   A, B       ; n == 1 ?
+0010  31 1b 00         JZ    base
+0013  50               PUSH  A          ; зберегти n — виклик знищить A
+0014  19               DEC   A
+0015  54 07 00         CALL  fact       ; A = fact(n-1)
+0018  53               POP   B          ; B = збережене n
+0019  1b               MUL   A, B       ; A = fact(n-1) * n
+001a  55               RET
+001b  20 01     base:  LOADI A, 1
+001d  55               RET
+labels: fact=0x0007 base=0x001b
+assembled 30 bytes: 0x0000-0x001d; PC=0x0000
+ember> dump 0 32
+0000  20 05 54 07 00 03 00 21 00 1a 31 1b 00 21 01 1a  | .T....!..1..!..|
+0010  31 1b 00 50 19 54 07 00 53 1b 55 20 01 55 00 00  |1..P.T..S.U .U..|
+ember> run
+120 
+halted after 60 steps
+ember> regs
+PC=0x0007  A=120  B=5  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember>
+```
+
+Порівняння всіх 30 байтів із `checks/lab-07.txt`, де вони набрані руками з того самого лістингу:
+
+```txt
+checks/lab-07.txt: 30 bytes; asm programs/fact.asm: 30 of them the same
+```
+
+### Помилки асемблера
+
+Перша помилка зупиняє збирання, і нічого не завантажується (дамп у кінці транскрипту — нулі). Вміст файлів: `bad-comma.asm` — `LOADI A 5`, `bad-300.asm` — `LOADI A, 300`, `bad-label.asm` — `JMP nowhere`, `bad-lower.asm` — `add A, B`, `bad-dup.asm`:
+
+```asm
+loop:   NOP
+        JMP loop
+loop:   HALT
+```
+
+```txt
+ember> asm programs/tests/bad-comma.asm
+line 1: expected , after A (LOADI A, imm8); nothing loaded
+ember> asm programs/tests/bad-300.asm
+line 1: 300 does not fit in imm8 (-128..255); nothing loaded
+ember> asm programs/tests/bad-label.asm
+line 1: unknown label nowhere; nothing loaded
+ember> asm programs/tests/bad-dup.asm
+line 3: label loop is already defined on line 1; nothing loaded
+ember> asm programs/tests/bad-lower.asm
+line 1: unknown mnemonic add (mnemonics are written in capitals, as in the ISA); nothing loaded
+ember> asm programs/tests/bad-gg.asm
+line 3: bad number; nothing loaded
+ember> asm programs/nope.asm
+cannot open programs/nope.asm
+ember> dump 0 8
+0000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+ember>
+```
+
+Те саме з командного рядка:
+
+```txt
+$ ./build/ember programs/tests/bad-gg.asm
+programs/tests/bad-gg.asm: line 3: bad number
+$ echo $?
+1
+$ ./build/ember programs/tests/bad-label.asm
+programs/tests/bad-label.asm: line 1: unknown label nowhere
+$ echo $?
+1
+```
+
+### Старий вивід не змінився
+
+Усі файли перевірок Lab 1–7 на збірці Lab 07 (`212a626`) і на поточній (у Lab 06 файлу перевірок немає):
+
+```sh
+#!/bin/sh
+# Lab 07 (212a626) against the working tree: every check file of Labs 1-7.
+# Lab 8 moved instr_size() and mnemonic() onto the table of isa.cpp; the
+# output of every old command must stay byte for byte the same.
+old=$(mktemp -d)
+git archive 212a626 src CMakeLists.txt | tar -x -C "$old"
+cmake -S "$old" -B "$old/build" -DCMAKE_BUILD_TYPE=Debug > /dev/null
+cmake --build "$old/build" -j 8 > /dev/null
+for f in docs/checks/lab-01.txt notes-local/lab-0[2-7]/upstream/checks/lab-0?.txt; do
+    "$old/build/ember" < "$f" > "$old/a.out" 2> "$old/a.err"; ea=$?
+    ./build/ember < "$f" > "$old/b.out" 2> "$old/b.err"; eb=$?
+    if cmp -s "$old/a.out" "$old/b.out" && [ ! -s "$old/a.err" ] && [ ! -s "$old/b.err" ] &&
+       [ $ea -eq 0 ] && [ $eb -eq 0 ]; then
+        echo "$(basename "$f"): identical, $(wc -l < "$old/b.out") lines, exit 0, stderr empty"
+    else
+        echo "$(basename "$f"): DIFFERENT (exit $ea/$eb)"
+    fi
+done
+echo help | "$old/build/ember" > "$old/a.out"
+echo help | ./build/ember > "$old/b.out"
+echo "help: $(diff "$old/a.out" "$old/b.out" | grep -c '^>') lines added, $(diff "$old/a.out" "$old/b.out" | grep -c '^<') removed or changed"
+rm -rf "$old"
+```
+
+```txt
+lab-01.txt: identical, 262 lines, exit 0, stderr empty
+lab-02.txt: identical, 7 lines, exit 0, stderr empty
+lab-03.txt: identical, 4 lines, exit 0, stderr empty
+lab-04.txt: identical, 4 lines, exit 0, stderr empty
+lab-05.txt: identical, 35 lines, exit 0, stderr empty
+lab-07.txt: identical, 5 lines, exit 0, stderr empty
+help: 9 lines added, 0 removed or changed
+```
+
+Санітайзери на всіх шляхах — успіх і помилки, REPL і командний рядок, обидві збірки стека (`build/` — масив, `build/list/` — список):
+
+```sh
+#!/bin/sh
+# Every .asm of programs/ and programs/tests/ through lex, asm, asm onepass
+# and disasm in the REPL, and through the command line, in the array build
+# (build/) and the list build (build/list/). Both must print the same bytes,
+# the REPL must exit 0, and stderr must stay empty on every path, the error
+# ones included: no token, tree, label, fixup or listing node is leaked.
+t=$(mktemp -d)
+for f in programs/*.asm programs/tests/*.asm; do
+    printf 'lex %s\nasm %s\nasm %s onepass\ndisasm 0 64 0x800 0x810\n' "$f" "$f" "$f" > "$t/in"
+    ./build/ember < "$t/in" > "$t/a.out" 2> "$t/a.err"; ea=$?
+    ./build/list/ember < "$t/in" > "$t/l.out" 2> "$t/l.err"; el=$?
+    ./build/ember "$f" > "$t/a.cli" 2>> "$t/a.err"; ca=$?
+    ./build/list/ember "$f" > "$t/l.cli" 2>> "$t/l.err"; cl=$?
+    if cmp -s "$t/a.out" "$t/l.out" && cmp -s "$t/a.cli" "$t/l.cli" && [ $ca -eq $cl ] &&
+       [ ! -s "$t/a.err" ] && [ ! -s "$t/l.err" ] && [ $ea -eq 0 ] && [ $el -eq 0 ]; then
+        printf '%-31s array = list, ./build/ember exit %s, stderr empty\n' "$f:" $ca
+    else
+        echo "$f: DIFFERENT (exit $ea/$el, command line $ca/$cl)"
+    fi
+done
+rm -rf "$t"
+```
+
+```txt
+programs/bounce.asm:            array = list, ./build/ember exit 0, stderr empty
+programs/fact.asm:              array = list, ./build/ember exit 0, stderr empty
+programs/fib.asm:               array = list, ./build/ember exit 0, stderr empty
+programs/hello.asm:             array = list, ./build/ember exit 0, stderr empty
+programs/search.asm:            array = list, ./build/ember exit 0, stderr empty
+programs/tests/bad-0x.asm:      array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-12ab.asm:    array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-16x16.asm:   array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-300.asm:     array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-at.asm:      array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-comma.asm:   array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-dup.asm:     array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-gg.asm:      array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-label.asm:   array = list, ./build/ember exit 1, stderr empty
+programs/tests/bad-lower.asm:   array = list, ./build/ember exit 1, stderr empty
+programs/tests/countdown-nop.asm: array = list, ./build/ember exit 0, stderr empty
+programs/tests/countdown.asm:   array = list, ./build/ember exit 0, stderr empty
+programs/tests/expr.asm:        array = list, ./build/ember exit 0, stderr empty
+programs/tests/fib-nop.asm:     array = list, ./build/ember exit 0, stderr empty
+programs/tests/forward.asm:     array = list, ./build/ember exit 0, stderr empty
+programs/tests/halt.asm:        array = list, ./build/ember exit 0, stderr empty
+programs/tests/hello3.asm:      array = list, ./build/ember exit 0, stderr empty
+programs/tests/jmp0123.asm:     array = list, ./build/ember exit 0, stderr empty
+programs/tests/loop.asm:        array = list, ./build/ember exit 1, stderr empty
+programs/tests/macro-fixed.asm: array = list, ./build/ember exit 0, stderr empty
+programs/tests/macro.asm:       array = list, ./build/ember exit 0, stderr empty
+```
+
+`exit 1` у рядках `bad-*` — помилка збирання. У `loop.asm` це ліміт кроків: `loop: JMP loop` сам не зупиняється.
+
+## M3 — програми
+
+### `hello.asm`
+
+```txt
+ember> asm programs/hello.asm
+                ; hello.asm — OUTS рядка, зібраного в регіон даних (0x800)
+0000  04 00 08          OUTS msg
+0003  00                HALT
+
+                        .org 0x800
+0800  48 65 6c  msg:    .string "Hello, ember!\n"
+0803  6c 6f 2c
+0806  20 65 6d
+0809  62 65 72
+080c  21 0a 00
+labels: msg=0x0800
+assembled 19 bytes: 0x0000-0x0003, 0x0800-0x080e; PC=0x0000
+ember> dump 0x800 16
+0800  48 65 6c 6c 6f 2c 20 65 6d 62 65 72 21 0a 00 00  |Hello, ember!...|
+ember>
+```
+
+```txt
+$ ./build/ember programs/hello.asm
+Hello, ember!
+halted after 2 steps
+$ echo $?
+0
+```
+
+`.string` кладе в `0x800` байти рядка й нуль, `OUTS msg` друкує їх до нуля. Коду 4 байти, даних 15, кроків 2.
+
+### `search.asm` поруч із шістнадцятковим із Lab 04
+
+Лістинг Lab 04, набраний руками (розділ «Пошук усередині `ember`» вище):
+
+```txt
+адр.  байти       текст
+0000  28 00 08          LOADH H, 0x0800   ; i = lo
+0003  21 41             LOADI B, 0x41     ; що шукаємо; B більше не змінюється
+0005  29         loop:  LOAD  A, [H]      ; A = mem[i]
+0006  1A                CMP   A, B        ; Z = (mem[i] == 0x41)
+0007  31 16 00          JZ    found
+000A  2B                INCH              ; ++i
+000B  2D                HLOW              ; A = i (молодший байт H)
+000C  17                SHR   A
+000D  17                SHR   A
+000E  17                SHR   A           ; A = i / 8: 0, поки i < 8
+000F  31 05 00          JZ    loop        ; ще в ділянці
+0012  20 2D             LOADI A, '-'      ; промах
+0014  02                OUT
+0015  00                HALT
+0016  2D         found: HLOW              ; A = індекс
+0017  03                OUTN
+0018  00                HALT
+```
+
+Той самий пошук текстом, `programs/search.asm`:
+
+```asm
+; search.asm — лінійний пошук з Lab 04: де в [LO, LO + 8) лежить NEEDLE
+.define LO     0x0800
+.define NEEDLE 0x41
+        LOADH H, LO          ; i = lo
+        LOADI B, NEEDLE      ; B більше не змінюється
+loop:   LOAD  A, [H]         ; A = mem[i]
+        CMP   A, B
+        JZ    found
+        INCH                 ; ++i
+        HLOW
+        SHR   A
+        SHR   A
+        SHR   A              ; A = i / 8: 0, поки i < 8
+        JZ    loop
+        LOADI A, '-'         ; промах
+        OUT
+        HALT
+found:  HLOW                 ; A = індекс
+        OUTN
+        HALT
+
+        .org LO
+table:  .byte 0x10, 0x41, 0x30, 0x41, 0, 0, 0, 0
+```
+
+Лістинг, дамп і промах (обидва `0x41` прибрано через `set`):
+
+```txt
+ember> asm programs/search.asm
+                ; search.asm — лінійний пошук з Lab 04: де в [LO, LO + 8) лежить NEEDLE
+                .define LO     0x0800
+                .define NEEDLE 0x41
+0000  28 00 08          LOADH H, LO          ; i = lo
+0003  21 41             LOADI B, NEEDLE      ; B більше не змінюється
+0005  29        loop:   LOAD  A, [H]         ; A = mem[i]
+0006  1a                CMP   A, B
+0007  31 16 00          JZ    found
+000a  2b                INCH                 ; ++i
+000b  2d                HLOW
+000c  17                SHR   A
+000d  17                SHR   A
+000e  17                SHR   A              ; A = i / 8: 0, поки i < 8
+000f  31 05 00          JZ    loop
+0012  20 2d             LOADI A, '-'         ; промах
+0014  02                OUT
+0015  00                HALT
+0016  2d        found:  HLOW                 ; A = індекс
+0017  03                OUTN
+0018  00                HALT
+
+                        .org LO
+0800  10 41 30  table:  .byte 0x10, 0x41, 0x30, 0x41, 0, 0, 0, 0
+0803  41 00 00
+0806  00 00
+labels: loop=0x0005 found=0x0016 table=0x0800
+assembled 33 bytes: 0x0000-0x0018, 0x0800-0x0807; PC=0x0000
+ember> dump 0 32
+0000  28 00 08 21 41 29 1a 31 16 00 2b 2d 17 17 17 31  |(..!A).1..+-...1|
+0010  05 00 20 2d 02 00 2d 03 00 00 00 00 00 00 00 00  |.. -..-.........|
+ember> dump 0x800 16
+0800  10 41 30 41 00 00 00 00 00 00 00 00 00 00 00 00  |.A0A............|
+ember> set 0x801 0
+ember> set 0x803 0
+ember> run
+-
+halted after 77 steps
+ember>
+```
+
+Знайдено:
+
+```txt
+$ ./build/ember programs/search.asm
+1 
+halted after 17 steps
+$ echo $?
+0
+```
+
+Байти коду збігаються з Lab 04. Порівняння дампу `0 32` з README Lab 04 і дампу після `asm`:
+
+```txt
+$ diff <(grep -m1 -A1 '^0000  28 00 08 21 41' README.md) <(printf 'asm programs/search.asm\ndump 0 32\n' | ./build/ember | grep -A1 '0000  28 00 08 21 41' | sed 's/^ember> //') && echo same
+same
+```
+
+Ті самі 25 байтів коду, ті самі 17 кроків для знахідки й 77 для промаху. Що дав асемблер, одним реченням: адреси `0x0005` і `0x0016` тепер рахує він, а я пишу `loop`, `found`, `NEEDLE` і `'-'`, і вставлений рядок більше не змушує перераховувати переходи руками.
+
+### `fib.asm`
+
+Рекурсивний, на `CALL`/`RET` і конвенції ISA §6: аргумент в `A`, результат в `A`, `B` зберігає той, хто викликає. Перед першим рекурсивним `CALL` на стек іде `n` (`PUSH A`), після нього знімається в `B`. Перед другим на стеку чекає `fib(n-1)`. `n` задає `.define N 6`, тож байт `0x0001` — операнд `LOADI A, N`.
+
+```txt
+$ ./build/ember programs/fib.asm
+8 
+halted after 296 steps
+$ echo $?
+0
+```
+
+`fib(10)` без правки файла: після `asm` поставити байт `0x0001`. Потім `fib(19)`:
+
+```txt
+ember> asm programs/fib.asm
+                ; fib.asm — рекурсивний Фібоначчі на CALL/RET, конвенція ISA §6:
+                ; аргумент в A, результат в A; B псується (його зберігає той, хто викликає).
+                .define N 6                  ; змініть тут: fib(N)
+0000  20 06             LOADI A, N
+0002  54 07 00          CALL  fib
+0005  03                OUTN
+0006  00                HALT
+
+0007  21 00     fib:    LOADI B, 0
+0009  1a                CMP   A, B           ; n == 0 ?
+000a  31 22 00          JZ    ret_a          ; fib(0) = 0
+000d  21 01             LOADI B, 1
+000f  1a                CMP   A, B           ; n == 1 ?
+0010  31 22 00          JZ    ret_a          ; fib(1) = 1
+0013  50                PUSH  A              ; зберегти n
+0014  19                DEC   A
+0015  54 07 00          CALL  fib            ; A = fib(n-1)
+0018  53                POP   B              ; B = n
+0019  50                PUSH  A              ; зберегти fib(n-1)
+001a  26                MOV   A, B
+001b  19                DEC   A
+001c  19                DEC   A
+001d  54 07 00          CALL  fib            ; A = fib(n-2)
+0020  53                POP   B              ; B = fib(n-1)
+0021  10                ADD   A, B
+0022  55        ret_a:  RET
+labels: fib=0x0007 ret_a=0x0022
+assembled 35 bytes: 0x0000-0x0022; PC=0x0000
+ember> set 1 10
+ember> run
+55 
+halted after 2109 steps
+ember> regs
+PC=0x0007  A=55  B=34  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember> stack
+SP=0x0fff  empty, 256 free (stack 0x0f00-0x0fff); deepest SP=0x0fe2 (29 bytes)
+ember> asm programs/fib.asm
+                ; fib.asm — рекурсивний Фібоначчі на CALL/RET, конвенція ISA §6:
+                ; аргумент в A, результат в A; B псується (його зберігає той, хто викликає).
+                .define N 6                  ; змініть тут: fib(N)
+0000  20 06             LOADI A, N
+0002  54 07 00          CALL  fib
+0005  03                OUTN
+0006  00                HALT
+
+0007  21 00     fib:    LOADI B, 0
+0009  1a                CMP   A, B           ; n == 0 ?
+000a  31 22 00          JZ    ret_a          ; fib(0) = 0
+000d  21 01             LOADI B, 1
+000f  1a                CMP   A, B           ; n == 1 ?
+0010  31 22 00          JZ    ret_a          ; fib(1) = 1
+0013  50                PUSH  A              ; зберегти n
+0014  19                DEC   A
+0015  54 07 00          CALL  fib            ; A = fib(n-1)
+0018  53                POP   B              ; B = n
+0019  50                PUSH  A              ; зберегти fib(n-1)
+001a  26                MOV   A, B
+001b  19                DEC   A
+001c  19                DEC   A
+001d  54 07 00          CALL  fib            ; A = fib(n-2)
+0020  53                POP   B              ; B = fib(n-1)
+0021  10                ADD   A, B
+0022  55        ret_a:  RET
+labels: fib=0x0007 ret_a=0x0022
+assembled 35 bytes: 0x0000-0x0022; PC=0x0000
+ember> set 1 19
+ember> run
+step limit 100000 reached at 0x001d
+stopped after 100000 steps
+ember>
+```
+
+`fib(19)` не доходить до кінця: наївна рекурсія робить понад 100000 кроків, а це ліміт `run` (`fib(18)` ще вкладається — 99720 кроків). Результати, більші за 255, `A` тримає за модулем 256, як і всю 8-бітну арифметику. Порівняння з еталоном CHECKS:
+
+| | еталон CHECKS | `programs/fib.asm` |
+|---|---|---|
+| рядків з інструкціями | 22 | 22 |
+| байтів | 35 | 35 (`0x0000`–`0x0022`) |
+| мітка `fib` | `0x07` | `0x0007` |
+| мітка `ret_a` | `0x22` | `0x0022` |
+| `fib(6)` | `8`, 296 кроків | `8`, 296 кроків |
+| `fib(10)` | `55`, 2109 кроків | `55`, 2109 кроків |
+| `SP` після `fib` | `0xFFF` | `0x0fff` |
+
+Найглибше стек сягає `0x0fe2` для `fib(10)` (29 байтів) і `0x0fee` для `fib(6)`. Як знайти, що зламалось у `fib`: точка зупину на `ret_a` і `stack`. На першому `RET` на стеку 17 байтів (новіший перший): п'ять адрес повернення `0x0018` (байти `00 18`, бо кожен виклик іде з `CALL fib` за адресою `0x0015`), між ними збережені `n` = 2…6, а внизу `00 05` — повернення в `main`:
+
+```txt
+ember> asm programs/fib.asm
+                ; fib.asm — рекурсивний Фібоначчі на CALL/RET, конвенція ISA §6:
+                ; аргумент в A, результат в A; B псується (його зберігає той, хто викликає).
+                .define N 6                  ; змініть тут: fib(N)
+0000  20 06             LOADI A, N
+0002  54 07 00          CALL  fib
+0005  03                OUTN
+0006  00                HALT
+
+0007  21 00     fib:    LOADI B, 0
+0009  1a                CMP   A, B           ; n == 0 ?
+000a  31 22 00          JZ    ret_a          ; fib(0) = 0
+000d  21 01             LOADI B, 1
+000f  1a                CMP   A, B           ; n == 1 ?
+0010  31 22 00          JZ    ret_a          ; fib(1) = 1
+0013  50                PUSH  A              ; зберегти n
+0014  19                DEC   A
+0015  54 07 00          CALL  fib            ; A = fib(n-1)
+0018  53                POP   B              ; B = n
+0019  50                PUSH  A              ; зберегти fib(n-1)
+001a  26                MOV   A, B
+001b  19                DEC   A
+001c  19                DEC   A
+001d  54 07 00          CALL  fib            ; A = fib(n-2)
+0020  53                POP   B              ; B = fib(n-1)
+0021  10                ADD   A, B
+0022  55        ret_a:  RET
+labels: fib=0x0007 ret_a=0x0022
+assembled 35 bytes: 0x0000-0x0022; PC=0x0000
+ember> b 0x22
+breakpoint at 0x0022
+ember> run
+breakpoint at 0x0022
+stopped after 53 steps
+ember> stack 17
+SP=0x0fee  17 bytes on the stack, 239 free (stack 0x0f00-0x0fff); deepest SP=0x0fee (17 bytes)
+  0x0fef  00  <- top
+  0x0ff0  18
+  0x0ff1  02
+  0x0ff2  00
+  0x0ff3  18
+  0x0ff4  03
+  0x0ff5  00
+  0x0ff6  18
+  0x0ff7  04
+  0x0ff8  00
+  0x0ff9  18
+  0x0ffa  05
+  0x0ffb  00
+  0x0ffc  18
+  0x0ffd  06
+  0x0ffe  00
+  0x0fff  05
+ember> b off
+no breakpoint
+ember> run
+8 
+halted after 243 steps
+ember> regs
+PC=0x0007  A=8  B=5  H=0x0000  SP=0x0fff  Z=0 N=0 C=0
+ember> stack
+SP=0x0fff  empty, 256 free (stack 0x0f00-0x0fff); deepest SP=0x0fee (17 bytes)
+ember>
+```
+
+Другий `run` продовжує з `0x0022`: 53 + 243 = 296 кроків.
+
+**Аргумент лаби.** Lab 07 закінчилась тим, що одна вставлена інструкція змушує перерахувати руками кожну адресу. Тут `programs/tests/fib-nop.asm` — той самий `fib.asm` з `NOP` після `HALT`. Різниця двох лістингів:
+
+```txt
+$ diff <(echo 'asm programs/fib.asm' | ./build/ember) <(echo 'asm programs/tests/fib-nop.asm' | ./build/ember)
+6c6
+< 0002  54 07 00          CALL  fib
+---
+> 0002  54 08 00          CALL  fib
+8a9
+> 0007  01                NOP                  ; одна вставлена інструкція
+10,22c11,22
+< 0007  21 00     fib:    LOADI B, 0
+< 0009  1a                CMP   A, B           ; n == 0 ?
+< 000a  31 22 00          JZ    ret_a          ; fib(0) = 0
+< 000d  21 01             LOADI B, 1
+< 000f  1a                CMP   A, B           ; n == 1 ?
+< 0010  31 22 00          JZ    ret_a          ; fib(1) = 1
+< 0013  50                PUSH  A              ; зберегти n
+< 0014  19                DEC   A
+< 0015  54 07 00          CALL  fib            ; A = fib(n-1)
+< 0018  53                POP   B              ; B = n
+< 0019  50                PUSH  A              ; зберегти fib(n-1)
+< 001a  26                MOV   A, B
+< 001b  19                DEC   A
+---
+> 0008  21 00     fib:    LOADI B, 0
+> 000a  1a                CMP   A, B           ; n == 0 ?
+> 000b  31 23 00          JZ    ret_a          ; fib(0) = 0
+> 000e  21 01             LOADI B, 1
+> 0010  1a                CMP   A, B           ; n == 1 ?
+> 0011  31 23 00          JZ    ret_a          ; fib(1) = 1
+> 0014  50                PUSH  A              ; зберегти n
+> 0015  19                DEC   A
+> 0016  54 08 00          CALL  fib            ; A = fib(n-1)
+> 0019  53                POP   B              ; B = n
+> 001a  50                PUSH  A              ; зберегти fib(n-1)
+> 001b  26                MOV   A, B
+24,29c24,30
+< 001d  54 07 00          CALL  fib            ; A = fib(n-2)
+< 0020  53                POP   B              ; B = fib(n-1)
+< 0021  10                ADD   A, B
+< 0022  55        ret_a:  RET
+< labels: fib=0x0007 ret_a=0x0022
+< assembled 35 bytes: 0x0000-0x0022; PC=0x0000
+---
+> 001d  19                DEC   A
+> 001e  54 08 00          CALL  fib            ; A = fib(n-2)
+> 0021  53                POP   B              ; B = fib(n-1)
+> 0022  10                ADD   A, B
+> 0023  55        ret_a:  RET
+> labels: fib=0x0008 ret_a=0x0023
+> assembled 36 bytes: 0x0000-0x0023; PC=0x0000
+```
+
+Усі адреси після вставки посунулись на 1, а п'ять операндів (`CALL fib` тричі, `JZ ret_a` двічі) асемблер перерахував сам. Програма друкує те саме `8`.
+
+## Advanced
+
+### `bounce.asm`
+
+Піксель їде екраном і відбивається від стінок. Координати й швидкість лежать у даних (`ball` у `0x800`), поля адресуються виразами `[ball+X]`, `[ball+DX]` через `.define`. Після `x += dx` перевірка «вийшов за 0..63» — це `AND A, 0x100-WIDTH`, тобто `AND A, 0xc0`: для `x = 64` і для `x = 255` (тобто −1) результат ненульовий. Тоді `dx = -dx` і `x += 2*dx`. Для `y` те саме з `0x100-HEIGHT` (`0xe0`). Старт — `x = 61, y = 1, dx = +1, dy = -1`, кадрів 5 (`.define FRAMES 5`). У кадрі 2 піксель торкається верхньої стінки, у кадрі 3 — правої, далі їде вниз-ліворуч.
+
+```txt
+ember> asm programs/bounce.asm
+                ; bounce.asm — піксель їде екраном і відбивається від стінок (Advanced)
+                .define FRAMES 5             ; скільки кадрів показати
+                .define WIDTH  64
+                .define HEIGHT 32
+                .define X  0                 ; поля м'ячика: [ball+X], [ball+Y], ...
+                .define Y  1
+                .define DX 2                 ; швидкість: +1 або -1 (0xff)
+                .define DY 3
+0000  40                CLS
+0001  22 00 08  frame:  LOAD  A, [ball+X]
+0004  23 01 08          LOAD  B, [ball+Y]
+0007  41                PLOT
+0008  43                SHOW
+0009  42                UNPLOT               ; A і B ще x і y: стерти перед кроком
+
+000a  23 02 08          LOAD  B, [ball+DX]   ; x += dx
+000d  10                ADD   A, B
+000e  24 00 08          STORE [ball+X], A
+0011  21 c0             LOADI B, 0x100-WIDTH ; біти, яких у 0..WIDTH-1 немає
+0013  12                AND   A, B
+0014  31 29 00          JZ    x_ok           ; ще на екрані
+0017  20 00             LOADI A, 0           ; вилетів: dx = -dx,
+0019  23 02 08          LOAD  B, [ball+DX]
+001c  11                SUB   A, B
+001d  24 02 08          STORE [ball+DX], A
+0020  27                MOV   B, A
+0021  10                ADD   A, B           ; x += 2 * dx: назад і крок від стінки
+0022  23 00 08          LOAD  B, [ball+X]
+0025  10                ADD   A, B
+0026  24 00 08          STORE [ball+X], A
+0029  22 01 08  x_ok:   LOAD  A, [ball+Y]    ; y += dy, так само
+002c  23 03 08          LOAD  B, [ball+DY]
+002f  10                ADD   A, B
+0030  24 01 08          STORE [ball+Y], A
+0033  21 e0             LOADI B, 0x100-HEIGHT
+0035  12                AND   A, B
+0036  31 4b 00          JZ    y_ok
+0039  20 00             LOADI A, 0
+003b  23 03 08          LOAD  B, [ball+DY]
+003e  11                SUB   A, B
+003f  24 03 08          STORE [ball+DY], A
+0042  27                MOV   B, A
+0043  10                ADD   A, B
+0044  23 01 08          LOAD  B, [ball+Y]
+0047  10                ADD   A, B
+0048  24 01 08          STORE [ball+Y], A
+004b  22 04 08  y_ok:   LOAD  A, [left]      ; ще кадр?
+004e  19                DEC   A
+004f  24 04 08          STORE [left], A
+0052  32 01 00          JNZ   frame
+0055  00                HALT
+
+                        .org 0x800
+0800  3d 01 01  ball:   .byte 61, 1, 1, -1   ; x, y, dx, dy: біля правого верхнього кута
+0803  ff
+0804  05        left:   .byte FRAMES
+labels: frame=0x0001 x_ok=0x0029 y_ok=0x004b ball=0x0800 left=0x0804
+assembled 91 bytes: 0x0000-0x0055, 0x0800-0x0804; PC=0x0000
+ember>
+```
+
+```txt
+$ ./build/ember programs/bounce.asm
+................................................................
+.............................................................#..
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+..............................................................#.
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+...............................................................#
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+..............................................................#.
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+.............................................................#..
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+halted after 130 steps
+$ echo $?
+0
+```
+
+### Дизасемблер
+
+`disasm <lo> <hi>` проходить `[lo, hi)` з розмірами з тієї ж таблиці й друкує рядок на інструкцію у форматі лістингу: адреса, байти, текст. Текст (з колонки 17) — валідне джерело:
+
+- мнемоніка з таблиці з операндом у hex (`LOADI A, 0x06`);
+- байт, що не є опкодом, і інструкція, яка не вміщається до `hi`, — `.byte 0x..`;
+- інструкція з `addr16` поза коробкою — три `.byte`, а сама інструкція в коментарі;
+- мітки останнього `asm` стоять перед інструкцією на своїй адресі (`fib: …`), а операнд `addr16`/`imm16`, що дорівнює такій мітці, пишеться її ім'ям (`CALL fib`);
+- кілька діапазонів розділяє `.org`; діапазони не можуть перетинатись.
+
+`fib`: рядок `asm` і рядок `disasm` з тією самою адресою поруч. Таблицю скрипт зводить з одного сеансу `asm programs/fib.asm` + `disasm 0 0x23`. Адреси й байти в обох виводах однакові (скрипт це перевіряє), тому показані один раз:
+
+```txt
+адр.  байти       asm programs/fib.asm (рядок джерела)              disasm 0 0x23
+0000  20 06             LOADI A, N                                LOADI A, 0x06
+0002  54 07 00          CALL  fib                                 CALL fib
+0005  03                OUTN                                      OUTN
+0006  00                HALT                                      HALT
+0007  21 00     fib:    LOADI B, 0                                fib: LOADI B, 0x00
+0009  1a                CMP   A, B           ; n == 0 ?           CMP A, B
+000a  31 22 00          JZ    ret_a          ; fib(0) = 0         JZ ret_a
+000d  21 01             LOADI B, 1                                LOADI B, 0x01
+000f  1a                CMP   A, B           ; n == 1 ?           CMP A, B
+0010  31 22 00          JZ    ret_a          ; fib(1) = 1         JZ ret_a
+0013  50                PUSH  A              ; зберегти n         PUSH A
+0014  19                DEC   A                                   DEC A
+0015  54 07 00          CALL  fib            ; A = fib(n-1)       CALL fib
+0018  53                POP   B              ; B = n              POP B
+0019  50                PUSH  A              ; зберегти fib(n-1)  PUSH A
+001a  26                MOV   A, B                                MOV A, B
+001b  19                DEC   A                                   DEC A
+001c  19                DEC   A                                   DEC A
+001d  54 07 00          CALL  fib            ; A = fib(n-2)       CALL fib
+0020  53                POP   B              ; B = fib(n-1)       POP B
+0021  10                ADD   A, B                                ADD A, B
+0022  55        ret_a:  RET                                       ret_a: RET
+```
+
+Відрізняється лише текст: дизасемблер не знає `.define` (`N` → `0x06`), коментарів і вирівнювання, а числа пише в hex (`0` → `0x00`). Обидві мітки й усі п'ять операндів-міток відновились.
+
+```txt
+ember> disasm 0 8 4 12
+ranges must not overlap
+ember> disasm 0 0x1001
+range must be 0 <= lo <= hi <= 4096
+ember>
+```
+
+**Повний оберт.** Зібрати, дизасемблювати, текст із колонки 17 зібрати знову, порівняти байти:
+
+```txt
+$ printf 'asm programs/fib.asm\ndisasm 0 0x23\n' | ./build/ember | awk -F'ember> ' 'NF > 1 { n++; $0 = $NF } n == 2' | cut -c17- > /tmp/fib-back.asm; cat /tmp/fib-back.asm
+LOADI A, 0x06
+CALL fib
+OUTN
+HALT
+fib: LOADI B, 0x00
+CMP A, B
+JZ ret_a
+LOADI B, 0x01
+CMP A, B
+JZ ret_a
+PUSH A
+DEC A
+CALL fib
+POP B
+PUSH A
+MOV A, B
+DEC A
+DEC A
+CALL fib
+POP B
+ADD A, B
+ret_a: RET
+```
+
+```txt
+$ diff <(printf 'asm programs/fib.asm\ndump 0 48\n' | ./build/ember | tail -4) <(printf 'asm /tmp/fib-back.asm\ndump 0 48\n' | ./build/ember | tail -4) && echo same
+same
+```
+
+Те саме для кожного файлу з `programs/` і `programs/tests/` робить скрипт: діапазони бере з рядка `assembled …` (код і дані), дизасемблює їх, збирає текст знову й порівнює дампи цих діапазонів. Заодно він порівнює з двома проходами байти `asm … onepass` («Якщо встигаєте»). Файли, які не збираються (`bad-*`), він пропускає з повідомленням асемблера:
+
+```txt
+programs/bounce.asm                            disasm 0x0000 0x0056 0x0800 0x0805 ->  48 lines; round trip: same bytes; onepass: same bytes
+programs/fact.asm                              disasm 0x0000 0x001e ->  18 lines; round trip: same bytes; onepass: same bytes
+programs/fib.asm                               disasm 0x0000 0x0023 ->  22 lines; round trip: same bytes; onepass: same bytes
+programs/hello.asm                             disasm 0x0000 0x0004 0x0800 0x080f ->  16 lines; round trip: same bytes; onepass: same bytes
+programs/search.asm                            disasm 0x0000 0x0019 0x0800 0x0808 ->  24 lines; round trip: same bytes; onepass: same bytes
+no asm      programs/tests/bad-0x.asm: line 2: bad number; nothing loaded
+no asm      programs/tests/bad-12ab.asm: line 1: bad number; nothing loaded
+no asm      programs/tests/bad-16x16.asm: line 1: 256 does not fit in imm8 (-128..255); nothing loaded
+no asm      programs/tests/bad-300.asm: line 1: 300 does not fit in imm8 (-128..255); nothing loaded
+no asm      programs/tests/bad-at.asm: line 2: unexpected character '@'; nothing loaded
+no asm      programs/tests/bad-comma.asm: line 1: expected , after A (LOADI A, imm8); nothing loaded
+no asm      programs/tests/bad-dup.asm: line 3: label loop is already defined on line 1; nothing loaded
+no asm      programs/tests/bad-gg.asm: line 3: bad number; nothing loaded
+no asm      programs/tests/bad-label.asm: line 1: unknown label nowhere; nothing loaded
+no asm      programs/tests/bad-lower.asm: line 1: unknown mnemonic add (mnemonics are written in capitals, as in the ISA); nothing loaded
+programs/tests/countdown-nop.asm               disasm 0x0000 0x0009 ->   6 lines; round trip: same bytes; onepass: same bytes
+programs/tests/countdown.asm                   disasm 0x0000 0x0008 ->   5 lines; round trip: same bytes; onepass: same bytes
+programs/tests/expr.asm                        disasm 0x0000 0x000c 0x0800 0x0802 ->   9 lines; round trip: same bytes; onepass: same bytes
+programs/tests/fib-nop.asm                     disasm 0x0000 0x0024 ->  23 lines; round trip: same bytes; onepass: same bytes
+programs/tests/forward.asm                     disasm 0x0000 0x0005 ->   3 lines; round trip: same bytes; onepass: same bytes
+programs/tests/halt.asm                        disasm 0x0000 0x0001 ->   1 lines; round trip: same bytes; onepass: same bytes
+programs/tests/hello3.asm                      disasm 0x0000 0x0004 ->   3 lines; round trip: same bytes; onepass: same bytes
+programs/tests/jmp0123.asm                     disasm 0x0000 0x0003 ->   1 lines; round trip: same bytes; onepass: same bytes
+programs/tests/loop.asm                        disasm 0x0000 0x0003 ->   1 lines; round trip: same bytes; onepass: same bytes
+programs/tests/macro-fixed.asm                 disasm 0x0000 0x0004 ->   3 lines; round trip: same bytes; onepass: same bytes
+programs/tests/macro.asm                       disasm 0x0000 0x0004 ->   3 lines; round trip: same bytes; onepass: same bytes
+```
+
+### Вирази й `.define`
+
+**Вираз — двійкове дерево.** Вузол `Expr`:
+
+```cpp
+struct Expr {
+    enum class Kind { Num, Name, Add, Sub, Mul, Neg };
+    Kind kind;
+    long value;       // Num: its value
+    std::string name; // Num: the text as written (0x41, '-'); Name: the label
+    int line;
+    Expr* left;  // Add, Sub, Mul: the left operand; Neg: the only one
+    Expr* right; // Add, Sub, Mul: the right operand; otherwise nullptr
+};
+```
+
+Розбір — рекурсивний спуск за граматикою з M2, одна функція на правило: `expr` → `term` → `unary` → `atom`. `*` зв'язує сильніше за `+` і `-`, бо `term` глибше за `expr`. Ланцюжок `2-3-4` збирається вліво, тобто `(2-3)-4`. Вузли створює `new`, звільняє рекурсивний `expr_destroy` — і на успіху, і на помилці розбору. Обчислення йде в `long long`, і якщо модуль проміжного значення більший за `0xFFFFFF`, це помилка, а не переповнення. Влазить значення в байт чи ні, перевіряє вже операнд. `expr` друкує дерево (відступ 2 на рівень) і значення:
+
+```txt
+ember> expr (2+3)*4
+*
+  +
+    2
+    3
+  4
+= 20  (0x0014)
+ember> expr 2+3*4
++
+  2
+  *
+    3
+    4
+= 14  (0x000e)
+ember> expr 2-3-4
+-
+  -
+    2
+    3
+  4
+= -5
+ember> expr 0x10*(1+2)-(-3)
+-
+  *
+    0x10
+    +
+      1
+      2
+  neg
+    3
+= 51  (0x0033)
+ember> expr '-'+1
++
+  '-'
+  1
+= 46  (0x002e)
+ember> expr 2+
+line 1: expected a number or a label, got end of file
+ember> expr nowhere
+nowhere
+line 1: unknown label nowhere
+ember>
+```
+
+У програмі, `programs/tests/expr.asm`; `expr` після `asm` бачить її мітки:
+
+```txt
+ember> asm programs/tests/expr.asm
+                ; вирази в операндах
+0000  20 05             LOADI A, 2+3
+0002  20 0e             LOADI A, 2+3*4
+0004  20 14             LOADI A, (2+3)*4
+0006  20 ff             LOADI A, -1
+0008  22 01 08          LOAD  A, [data+1]
+000b  00                HALT
+                        .org 0x800
+0800  07 2a     data:   .byte 7, 42
+labels: data=0x0800
+assembled 14 bytes: 0x0000-0x000b, 0x0800-0x0801; PC=0x0000
+ember> expr data+1
++
+  data
+  1
+= 2049  (0x0801)
+ember>
+```
+
+`programs/tests/bad-16x16.asm` — `LOADI A, 16*16`:
+
+```txt
+$ ./build/ember programs/tests/bad-16x16.asm
+programs/tests/bad-16x16.asm: line 1: 256 does not fit in imm8 (-128..255)
+$ echo $?
+1
+```
+
+**`.define` — токенний макрос.** `.define NAME токени…` до кінця рядка. Прохід 0 (до першого проходу) іде списком токенів і замінює кожне наступне `Ident(NAME)` копією цих токенів з номером рядка місця вживання (`cut` + `splice`), а сам рядок `.define` вирізає зі списку. Тіло розкривається там, де макрос визначено, тому макрос не може викликати сам себе. Перевизначення, порожнє тіло й ім'я, яке збігається з мнемонікою чи регістром, — помилки. Оскільки підставляються токени, а не значення, повторюється пастка макросів C з Lab 07. `programs/tests/macro.asm`:
+
+```asm
+.define N 2+3
+        LOADI A, N*2         ; 2+3*2 = 8, а не 10
+        OUTN
+        HALT
+```
+
+```txt
+ember> asm programs/tests/macro.asm
+                .define N 2+3
+0000  20 08             LOADI A, N*2         ; 2+3*2 = 8, а не 10
+0002  03                OUTN
+0003  00                HALT
+labels: none
+assembled 4 bytes: 0x0000-0x0003; PC=0x0000
+ember> run
+8 
+halted after 3 steps
+ember>
+```
+
+`N*2` стало `2+3*2` = 8. Виправлення — дужки в тілі, `programs/tests/macro-fixed.asm`:
+
+```txt
+ember> asm programs/tests/macro-fixed.asm
+                .define N (2+3)
+0000  20 0a             LOADI A, N*2         ; (2+3)*2 = 10
+0002  03                OUTN
+0003  00                HALT
+labels: none
+assembled 4 bytes: 0x0000-0x0003; PC=0x0000
+ember> run
+10 
+halted after 3 steps
+ember>
+```
+
+## Якщо встигаєте
+
+`bounce.asm`, дизасемблер з повним обертом, вирази з деревом і `.define` — у розділі Advanced вище.
+
+### Черга відкладених операндів: `asm … onepass`
+
+Один прохід замість двох. Операнд, у якому є ще невідома мітка, отримує байти-заглушки `00` і стає вузлом `Fixup` у черзі FIFO (зв'язний список з `head` і `tail`: `push_back` у хвіст, `pop_front` з голови). Після останнього рядка всі мітки відомі, і черга розвантажується: вирази обчислюються, байти дописуються, а на кожну латку друкується рядок `fixup`.
+
+```cpp
+struct Fixup {
+    std::uint16_t at;
+    Slot slot;
+    Expr* expr;
+    int line;
+    std::string text;
+    long value;
+    Fixup* next;
+};
+
+    if (r == EvalResult::unknown_label && a.pass == Pass::single) {
+        Fixup* f = new Fixup{static_cast<std::uint16_t>(a.pc), s, e, line, "", 0, nullptr};
+        if (!a.queue_head)
+            a.queue_head = a.queue_tail = f;
+        else
+            a.queue_tail = a.queue_tail->next = f;
+        a.error.clear();                 // not an error yet: the drain decides
+        return put_value(a, s, 0, line); // placeholder bytes: 00 (00)
+    }
+
+bool drain(Asm& a) {
+    while (a.queue_head) {
+        Fixup* f = a.queue_head;
+        a.queue_head = f->next;
+        f->next = nullptr;
+        long v = 0;
+        const EvalResult r = expr_eval(f->expr, a.p.labels, v, a.error);
+        f->text = expr_text(f->expr);
+        expr_destroy(f->expr);
+        f->expr = nullptr;
+        f->value = v;
+        Program& p = a.p;
+        if (!p.patched)
+            p.patched = p.patched_tail = f;
+        else
+            p.patched_tail = p.patched_tail->next = f;
+        if (r != EvalResult::ok || !fits(a, f->slot, v, f->line))
+            return false;
+        const auto u = static_cast<unsigned long>(v);
+        p.bytes[f->at] = static_cast<Byte>(u & 0xFF);
+        if (slot_size(f->slot) == 2)
+            p.bytes[f->at + 1] = static_cast<Byte>((u >> 8) & 0xFF);
+    }
+    return true;
+}
+```
+
+```txt
+ember> asm programs/tests/forward.asm onepass
+0000  30 04 00         JMP done    ; ще не знаємо адресу
+0003  01               NOP
+0004  00        done:  HALT
+labels: done=0x0004
+fixup 0x0001 <- done = 0x0004 (line 1)
+assembled 5 bytes: 0x0000-0x0004; PC=0x0000
+ember> dump 0 8
+0000  30 04 00 01 00 00 00 00 00 00 00 00 00 00 00 00  |0...............|
+ember>
+```
+
+```txt
+$ printf 'asm programs/fib.asm onepass\n' | ./build/ember | grep fixup
+fixup 0x0003 <- fib = 0x0007 (line 5)
+fixup 0x000b <- ret_a = 0x0022 (line 11)
+fixup 0x0011 <- ret_a = 0x0022 (line 14)
+```
+
+У `fib` відкладено три операнди: `CALL fib` з `main` і обидва `JZ ret_a`. Рекурсивні `CALL fib` ідуть після мітки `fib`, і їх асемблер записує одразу. Що байти `onepass` збігаються з двопрохідними для всіх файлів, показує колонка `onepass` у таблиці повного оберту вище.
+
+### Три речі з *Scanning*, які я пропустив
+
+Прочитав розділ [Scanning](https://craftinginterpreters.com/scanning.html) з Crafting Interpreters і порівняв зі своїм лексером.
+
+1. **Усі помилки за один запуск** (§4.5.1 «Lexical errors»). Сканер Lox, натрапивши на недозволений символ, повідомляє про нього, ставить `hadError` і сканує далі, тож за один запуск людина бачить усі погані символи файлу. Даний `lex()` на першій помилці робить `break`, звільняє список і повертає `nullptr`, тому файл із трьома помилками доводиться запускати тричі. Асемблер теж зупиняється на першій.
+2. **Значення літерала в токені** (§4.2.2 «Literal value»). Токен Lox несе `Object literal`: число перетворюється на значення ще під час сканування. Наш `Token` (дано) має лише `text`, і значення `0x41` асемблер рахує з того самого тексту (`number_value()`). Тобто число розбирається двічі: лексер перевіряє форму, асемблер — величину.
+3. **Місце помилки — лише рядок** (§4.2.3 «Location information»). У Lox токен теж знає лише `line`, але Nystrom пише, що кращі реалізації зберігають колонку й довжину або зсув від початку файлу й довжину. У нас лише `line`, тому `line 3: bad number` каже, у якому рядку помилка, але не може показати `^` під нею.
+
+Ще одне: зарезервовані слова (§4.7) Lox розпізнає вже в сканері — `and`, `class`, `while` стають окремими видами токенів. Наш лексер усе, що починається з літери, видає як `Ident`: для нього `LOADI` і мітка `loop` однакові, а мнемоніку впізнає асемблер за таблицею ISA.
+
+## Реалізовані рядки [ISA.uk.md](https://github.com/rmalkevy/Programming-Practice-Projects/blob/main/courses/programming-fundamentals/ISA.uk.md) (Лаба 8)
+
+Нових рядків ISA у Лабі 8 немає. Асемблер і дизасемблер знають усі рядки таблиці §5, разом з *opt* (`OUTS`, `HLOW`, `JC`, `JNC`, `UNPLOT`, `PUSH H`, `POP H`), — це ті самі рядки, які друкує `isa` (M2). `fib.asm` і `fact.asm` дотримуються конвенції виклику ISA §6 (розділ «Конвенція виклику» в Lab 07): аргумент і результат в `A`, а `B` і `H` зберігає той, хто викликає.
+
+## Власні розширення
+
+Нових опкодів у Лабі 8 немає. Директиви асемблера (`.org`, `.byte`, `.word`, `.string`, `.define`) — не опкоди. Власні рядки попередніх лаб асемблер знає під тими самими текстами:
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x70` | `JG addr16` | 3 | — | стрибнути, якщо `A > B` як знакові числа (−128..127); прапорці не читає й не змінює | 4 |
+| `0x71` | `JL addr16` | 3 | — | стрибнути, якщо `A < B` як знакові числа (−128..127); прапорці не читає й не змінює | 4 |
+| `0x72` | `FREE` | 1 | C | повернути в купу блок `[H, H + A)` (`A` — той самий розмір, що просили в `ALLOC`): верхній блок опускає вказівник купи, інший стає вузлом списку вільних блоків. Не блок купи, `A = 0`, уже вільний або менший за 3 байти не на вершині — виставити `C`, нічого не міняти | 6 |
+
+Решта дірок таблиці, наприклад `0x73`, — і далі невідомі опкоди. Байт стану лишається в `0xB02`, як із Lab 05.
+
+```txt
+ember> set 0 0x73
+ember> step
+unknown opcode 0x73 at 0x0000; nothing done
+ember>
+```

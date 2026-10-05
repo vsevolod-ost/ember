@@ -8,6 +8,7 @@
 #include "display.hpp"
 #include "guest_io.hpp"
 #include "heap.hpp"
+#include "isa.hpp"
 #include "opcodes.hpp"
 #include "stack.hpp"
 
@@ -15,67 +16,12 @@ Decoded decode(Byte op) {
     return {static_cast<Byte>((op >> 4) & 0x0F), static_cast<Byte>(op & 0x0F)};
 }
 
-// The "розмір" column of the ISA table, in one place.
+// The "розмір" column of the ISA table, in one place: the row of isa.cpp
+// that the assembler reads too (Lab 8).
 std::uint16_t instr_size(Byte op) {
-    switch (static_cast<Op>(op)) {
-    case Op::Halt:
-    case Op::Nop:
-    case Op::Out:
-    case Op::Outn:
-    case Op::Cls:
-    case Op::Plot:
-    case Op::Unplot:
-    case Op::Show:
-    case Op::Add:
-    case Op::Sub:
-    case Op::And:
-    case Op::Or:
-    case Op::Xor:
-    case Op::Not:
-    case Op::Shl:
-    case Op::Shr:
-    case Op::Inc:
-    case Op::Dec:
-    case Op::Cmp:
-    case Op::Mul:
-    case Op::PushA:
-    case Op::PopA:
-    case Op::PushB:
-    case Op::PopB:
-    case Op::Ret:
-    case Op::PushH:
-    case Op::PopH:
-    case Op::MovAB:
-    case Op::MovBA:
-    case Op::LoadAH:
-    case Op::StoreHA:
-    case Op::IncH:
-    case Op::DecH:
-    case Op::HLow:
-    case Op::Alloc:
-    case Op::Free:
-        return 1;
-    case Op::LoadiA:
-    case Op::LoadiB:
-        return 2; // opcode, imm8
-    case Op::Outs:
-    case Op::LoadA:
-    case Op::LoadB:
-    case Op::StoreA:
-    case Op::StoreB:
-    case Op::LoadH:
-    case Op::Jmp:
-    case Op::Jz:
-    case Op::Jnz:
-    case Op::Jc:
-    case Op::Jnc:
-    case Op::Jg:
-    case Op::Jl:
-    case Op::Call:
-        return 3; // opcode, then a 16-bit operand low byte first
-    default:
-        return 0; // no ISA row (yet): the first place an unknown opcode is caught
-    }
+    const IsaRow* row = isa_row(op);
+    // No row: 0, the first place an unknown opcode is caught.
+    return row ? row_size(*row) : 0;
 }
 
 std::string hex(unsigned v, int digits) {
@@ -85,115 +31,10 @@ std::string hex(unsigned v, int digits) {
 }
 
 // ISA text with the operands substituted. `imm8`/`w16` are only looked at for
-// the opcodes that have them.
+// the opcodes that have them. The text is the row of isa.cpp (Lab 8).
 static std::string mnemonic(Op op, Byte imm8, std::uint16_t w16) {
-    switch (op) {
-    case Op::Halt:
-        return "HALT";
-    case Op::Nop:
-        return "NOP";
-    case Op::Out:
-        return "OUT";
-    case Op::Outn:
-        return "OUTN";
-    case Op::Outs:
-        return "OUTS " + hex(w16, 4);
-    case Op::Cls:
-        return "CLS";
-    case Op::Plot:
-        return "PLOT";
-    case Op::Unplot:
-        return "UNPLOT";
-    case Op::Show:
-        return "SHOW";
-    case Op::Alloc:
-        return "ALLOC";
-    case Op::Add:
-        return "ADD A, B";
-    case Op::Sub:
-        return "SUB A, B";
-    case Op::And:
-        return "AND A, B";
-    case Op::Or:
-        return "OR A, B";
-    case Op::Xor:
-        return "XOR A, B";
-    case Op::Not:
-        return "NOT A";
-    case Op::Shl:
-        return "SHL A";
-    case Op::Shr:
-        return "SHR A";
-    case Op::Inc:
-        return "INC A";
-    case Op::Dec:
-        return "DEC A";
-    case Op::Cmp:
-        return "CMP A, B";
-    case Op::Mul:
-        return "MUL A, B";
-    case Op::PushA:
-        return "PUSH A";
-    case Op::PopA:
-        return "POP A";
-    case Op::PushB:
-        return "PUSH B";
-    case Op::PopB:
-        return "POP B";
-    case Op::Call:
-        return "CALL " + hex(w16, 4);
-    case Op::Ret:
-        return "RET";
-    case Op::PushH:
-        return "PUSH H";
-    case Op::PopH:
-        return "POP H";
-    case Op::LoadiA:
-        return "LOADI A, " + hex(imm8, 2);
-    case Op::LoadiB:
-        return "LOADI B, " + hex(imm8, 2);
-    case Op::LoadA:
-        return "LOAD A, [" + hex(w16, 4) + "]";
-    case Op::LoadB:
-        return "LOAD B, [" + hex(w16, 4) + "]";
-    case Op::StoreA:
-        return "STORE [" + hex(w16, 4) + "], A";
-    case Op::StoreB:
-        return "STORE [" + hex(w16, 4) + "], B";
-    case Op::MovAB:
-        return "MOV A, B";
-    case Op::MovBA:
-        return "MOV B, A";
-    case Op::LoadH:
-        return "LOADH H, " + hex(w16, 4);
-    case Op::LoadAH:
-        return "LOAD A, [H]";
-    case Op::StoreHA:
-        return "STORE [H], A";
-    case Op::IncH:
-        return "INCH";
-    case Op::DecH:
-        return "DECH";
-    case Op::HLow:
-        return "HLOW";
-    case Op::Jmp:
-        return "JMP " + hex(w16, 4);
-    case Op::Jz:
-        return "JZ " + hex(w16, 4);
-    case Op::Jnz:
-        return "JNZ " + hex(w16, 4);
-    case Op::Jc:
-        return "JC " + hex(w16, 4);
-    case Op::Jnc:
-        return "JNC " + hex(w16, 4);
-    case Op::Jg:
-        return "JG " + hex(w16, 4);
-    case Op::Jl:
-        return "JL " + hex(w16, 4);
-    case Op::Free:
-        return "FREE";
-    }
-    return "?";
+    const IsaRow* row = isa_row(static_cast<Byte>(op));
+    return row ? row_text(*row, imm8, w16) : "?";
 }
 
 // Read the whole instruction at `at` (PC, for step) before executing it: a

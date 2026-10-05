@@ -59,6 +59,22 @@ void report(StepResult r, const CPU& cpu) {
     }
 }
 
+void report_run(const RunResult& r, const CPU& cpu) {
+    guest_end_line();
+    if (r.why == RunStop::halted) {
+        std::cout << "halted after " << r.steps << " steps\n";
+    } else if (r.why == RunStop::error) {
+        report(r.error, cpu);
+    } else if (r.why == RunStop::breakpoint) {
+        std::cout << "breakpoint at " << hex(cpu.pc, 4) << '\n';
+    } else {
+        std::cout << "step limit " << RUN_STEP_LIMIT << " reached at " << hex(cpu.pc, 4) << '\n';
+    }
+    // Already halted before this run: the refusal says it all.
+    if (r.why != RunStop::halted && r.error != StepResult::halted)
+        std::cout << "stopped after " << r.steps << " steps\n";
+}
+
 // Why heap_alloc/heap_free said no, for `alloc` and `free`: "not freed: ...".
 void print_heap_refusal(const char* what, HeapResult r, const CPU& cpu) {
     std::uint16_t bad = 0;
@@ -138,6 +154,15 @@ void print_help() {
               << "  free <addr> <n>   FREE n bytes at addr as the host; registers untouched\n"
               << "  value <byte|addr|sprite> <n>\n"
               << "                    make a tagged Value and print it by its tag\n"
+              << "  lex <file.asm>    print the tokens of a file, one per line\n"
+              << "  asm <file.asm> [onepass]\n"
+              << "                    assemble a file: listing, labels; load it, PC=0x0000,\n"
+              << "                    SP=0x0fff, empty heap; onepass: one pass, forward\n"
+              << "                    labels patched from a queue\n"
+              << "  disasm <lo> <hi> [<lo> <hi> ...]\n"
+              << "                    bytes of [lo, hi) as instructions, labels of the last asm\n"
+              << "  expr <expression> parse an operand expression: its tree and value\n"
+              << "  isa               the instruction table: opcode, size, mnemonic\n"
               << "  help              this list\n"
               << "  quit              leave\n";
 }
