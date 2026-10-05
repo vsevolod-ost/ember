@@ -10,6 +10,7 @@ enum class Op : std::uint8_t {
     Nop = 0x01,
     Out = 0x02,  // print A as a character
     Outn = 0x03, // print A as a decimal number and a space
+    Outs = 0x04, // OUTS addr16: print the guest's C string at addr (Lab 5)
     // 0x1_ — ALU
     Add = 0x10,
     Sub = 0x11,
@@ -43,6 +44,11 @@ enum class Op : std::uint8_t {
     Jnz = 0x32,
     Jc = 0x33,
     Jnc = 0x34,
+    // 0x4_ — screen (Lab 5; UNPLOT is *opt*), pixel x = A, y = B
+    Cls = 0x40,
+    Plot = 0x41,
+    Unplot = 0x42,
+    Show = 0x43,
     // 0x7_ — own extensions (ISA §8: 0x70-0xFF are free), Lab 4
     Jg = 0x70, // jump if A > B as signed bytes (-128..127); flags untouched
     Jl = 0x71, // jump if A < B as signed bytes (-128..127); flags untouched

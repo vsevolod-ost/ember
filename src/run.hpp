@@ -11,7 +11,7 @@ enum class RunStop {
     halted,     // HALT executed (counted in steps)
     error,      // a step was refused; RunResult::error says why
     breakpoint, // PC reached the breakpoint before that instruction ran
-    step_limit, // RUN_STEP_LIMIT steps and no HALT; the machine is not halted
+    step_limit, // `limit` steps and no HALT; the machine is not halted
 };
 
 struct RunResult {
@@ -21,7 +21,8 @@ struct RunResult {
 };
 
 // Step from PC until HALT, an error, the breakpoint (a guest address, < 0
-// for none) or RUN_STEP_LIMIT steps. With `trace`, one line per step. The
+// for none) or `limit` steps. With `trace`, one line per step. The
 // breakpoint is not checked before the first step, so `run` from a
-// breakpoint goes on, like "continue" in a debugger.
-RunResult run(CPU& cpu, bool trace, long breakpoint);
+// breakpoint goes on, like "continue" in a debugger. `anim` passes a smaller
+// limit: one frame's worth of steps (Lab 5).
+RunResult run(CPU& cpu, bool trace, long breakpoint, unsigned long limit = RUN_STEP_LIMIT);

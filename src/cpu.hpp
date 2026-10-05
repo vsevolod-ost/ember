@@ -7,9 +7,18 @@
 #include "alu.hpp"
 #include "memory.hpp"
 
-// Extension: a byte in the spare region 0xB00-0xBFF that mirrors the flags
-// after every step, as 0b00000ZNC, so a guest program can read them.
-const std::size_t STATUS_ADDR = 0xB00;
+// The spare region 0xB00-0xBFF (ISA §2). Two addresses do something when the
+// GUEST touches them (*opt*, Lab 5); for the host they are plain memory.
+const std::size_t PORT_OUT = 0xB00; // a guest write also prints the byte as a character
+const std::size_t TICKS = 0xB01;    // a guest read gives the instructions run, mod 256
+
+// Extension: a byte that mirrors the flags after every step, as 0b00000ZNC,
+// so a guest program can read them. Lab 2 put it at 0xB00; it moved to 0xB02
+// in Lab 5, when 0xB00 and 0xB01 became the port and the timer.
+const std::size_t STATUS_ADDR = 0xB02;
+
+// OUTS prints at most this many bytes, even if no 0 comes.
+const std::size_t OUTS_MAX = 256;
 
 // One HOST pointer to the whole box, then GUEST addresses: pc and h are plain
 // numbers 0..0xFFF that mean something inside ember (you can see them in
@@ -21,6 +30,7 @@ struct CPU {
     Byte a = 0, b = 0;
     Flags f{};
     bool halted = false; // set by HALT; every later step refuses
+    Byte ticks = 0;      // instructions executed, mod 256 (the guest reads it at TICKS)
 };
 
 // An opcode byte is two fields: the high nibble is the group (0x1_ = ALU),
@@ -40,8 +50,8 @@ enum class StepResult {
     halted,        // HALT was executed earlier; nothing happened
     bad_opcode,    // not in the ISA rows implemented so far; nothing happened
     out_of_memory, // the instruction at PC does not fit below MEM_SIZE; nothing happened
-    bad_address,   // a LOAD/STORE operand (addr16 or H) or a taken jump's target is
-                   // >= MEM_SIZE; nothing happened
+    bad_address,   // a LOAD/STORE operand (addr16 or H), an OUTS operand or a taken
+                   // jump's target is >= MEM_SIZE; nothing happened
 };
 
 // Execute the instruction at PC. With `trace`, print one line for it.
@@ -54,7 +64,7 @@ std::string hex(unsigned v, int digits);
 std::string disasm(const Memory& mem, std::uint16_t at);
 
 // The guest address the instruction at PC uses: what a LOAD/STORE reads or
-// writes (addr16 or H), where a jump goes (addr16).
+// writes (addr16 or H), where OUTS starts, where a jump goes (addr16).
 std::uint16_t data_address(const CPU& cpu);
 
 // Print PC A B H Z N C on one line.

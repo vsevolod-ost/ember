@@ -5,6 +5,7 @@
 #include <iostream>
 #include <sstream>
 
+#include "display.hpp"
 #include "guest_io.hpp"
 #include "opcodes.hpp"
 
@@ -19,6 +20,10 @@ std::uint16_t instr_size(Byte op) {
     case Op::Nop:
     case Op::Out:
     case Op::Outn:
+    case Op::Cls:
+    case Op::Plot:
+    case Op::Unplot:
+    case Op::Show:
     case Op::Add:
     case Op::Sub:
     case Op::And:
@@ -41,6 +46,7 @@ std::uint16_t instr_size(Byte op) {
     case Op::LoadiA:
     case Op::LoadiB:
         return 2; // opcode, imm8
+    case Op::Outs:
     case Op::LoadA:
     case Op::LoadB:
     case Op::StoreA:
@@ -77,6 +83,16 @@ static std::string mnemonic(Op op, Byte imm8, std::uint16_t w16) {
         return "OUT";
     case Op::Outn:
         return "OUTN";
+    case Op::Outs:
+        return "OUTS " + hex(w16, 4);
+    case Op::Cls:
+        return "CLS";
+    case Op::Plot:
+        return "PLOT";
+    case Op::Unplot:
+        return "UNPLOT";
+    case Op::Show:
+        return "SHOW";
     case Op::Add:
         return "ADD A, B";
     case Op::Sub:
@@ -159,18 +175,30 @@ std::uint16_t data_address(const CPU& cpu) {
     return get16(*cpu.mem, cpu.pc + 1u);
 }
 
-// Every data access the GUEST makes goes through these two (LOAD/STORE, by
-// addr16 and by H). A guest address outside the box is refused, never
-// wrapped. Lab 5's output port and timer will hook in here, in one place.
+// Every access the GUEST makes to a byte it names by address goes through
+// these two (LOAD/STORE by addr16 and by H, OUTS). A guest address outside
+// the box is refused, never wrapped. The output port and the timer live here,
+// in one place, so they work for every way a guest reaches them; the host
+// (set, get, plot, sort) uses mem_get/mem_set and sees plain memory there.
+// CLS/PLOT/UNPLOT write VRAM through the same plot/clear as the REPL: VRAM
+// never overlaps the port.
 static bool guest_read(const CPU& cpu, std::size_t addr, Byte& out) {
     if (addr >= MEM_SIZE)
         return false;
-    out = mem_get(*cpu.mem, addr);
+    if (addr == TICKS)
+        // ticks does not count this instruction yet: it is counted when it ends.
+        out = static_cast<Byte>(cpu.ticks + 1);
+    else
+        out = mem_get(*cpu.mem, addr);
     return true;
 }
 
 static bool guest_write(CPU& cpu, std::size_t addr, Byte value) {
-    return mem_set(*cpu.mem, addr, value); // false (nothing written) if addr >= MEM_SIZE
+    if (!mem_set(*cpu.mem, addr, value))
+        return false; // nothing written: addr >= MEM_SIZE
+    if (addr == PORT_OUT)
+        guest_putc(value); // every write prints, even the same byte twice
+    return true;
 }
 
 // A taken jump: the next instruction is at `target`, not after this one (no
@@ -241,7 +269,7 @@ StepResult step(CPU& cpu, bool trace) {
     // Every error path returns before anything is changed. Each known opcode
     // has its own case; every default is the second place an unknown opcode
     // is caught (after instr_size). The 0x0_, 0x2_, 0x3_ and 0x7_ rows never
-    // touch the flags (ISA §3).
+    // touch the flags (ISA §3); the 0x4_ rows touch only C.
     switch (d.group) {
     case 0x0:
         switch (static_cast<Op>(op)) {
@@ -255,6 +283,17 @@ StepResult step(CPU& cpu, bool trace) {
             break;
         case Op::Outn:
             guest_putn(cpu.a);
+            break;
+        case Op::Outs:
+            // A C string of the guest: bytes up to the 0 (not printed), but at
+            // most OUTS_MAX of them, and never past the box: the end of the box
+            // is one more ceiling, not an error. Only a start outside the box
+            // is refused, before anything is printed.
+            if (w16 >= MEM_SIZE)
+                return StepResult::bad_address;
+            for (std::size_t addr = w16, n = 0; n < OUTS_MAX && guest_read(cpu, addr, v) && v != 0;
+                 ++addr, ++n)
+                guest_putc(v);
             break;
         default:
             return StepResult::bad_opcode;
@@ -384,6 +423,27 @@ StepResult step(CPU& cpu, bool trace) {
             return StepResult::bad_opcode;
         }
         break;
+    case 0x4:
+        // The screen. PLOT/UNPLOT touch only C: 1 = off the screen and
+        // nothing changed, 0 = done. Z and N are never touched.
+        switch (static_cast<Op>(op)) {
+        case Op::Cls:
+            clear(*cpu.mem);
+            break;
+        case Op::Plot:
+            cpu.f.c = !plot(*cpu.mem, cpu.a, cpu.b);
+            break;
+        case Op::Unplot:
+            cpu.f.c = !unplot(*cpu.mem, cpu.a, cpu.b);
+            break;
+        case Op::Show:
+            guest_end_line(); // the screen starts on a line of its own
+            show(*cpu.mem);
+            break;
+        default:
+            return StepResult::bad_opcode;
+        }
+        break;
     case 0x7:
         // Own extensions: compare A and B themselves as signed numbers. The
         // flags cannot say this alone: N of A - B is wrong when the
@@ -406,6 +466,7 @@ StepResult step(CPU& cpu, bool trace) {
     }
 
     cpu.pc = next;
+    ++cpu.ticks; // a Byte: 255 + 1 wraps to 0, the "mod 256" of TICKS
     mem_set(*cpu.mem, STATUS_ADDR, static_cast<Byte>((cpu.f.z << 2) | (cpu.f.n << 1) | cpu.f.c));
 
     if (trace)

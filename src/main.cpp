@@ -6,6 +6,7 @@
 // in Lab 1 you read this file, you do not write it.
 //
 // What you add in later labs is one more `else if` branch per command.
+#include <climits>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -13,12 +14,14 @@
 
 #include "alu.hpp"
 #include "cpu.hpp"
+#include "display.hpp"
 #include "dump.hpp"
 #include "guest_io.hpp"
 #include "hexdump.hpp"
 #include "memory.hpp"
 #include "run.hpp"
 #include "search.hpp"
+#include "sort.hpp"
 
 // Turn a word into a number. Accepts decimal (65) and hex (0x41).
 // Returns false if the word is not a number at all.
@@ -119,6 +122,19 @@ static void print_help() {
               << "  b <addr> | b off  stop run before the instruction at addr; b alone = off\n"
               << "  find <lo> <hi> <byte>\n"
               << "                    first address in [lo, hi) that holds byte\n"
+              << "  find <lo> <hi> !<byte>\n"
+              << "                    first address in [lo, hi) that does not hold byte\n"
+              << "  show              draw the screen: VRAM 0xA00-0xAFF, 64x32, # = lit\n"
+              << "  cls               turn every pixel off (256 zero bytes)\n"
+              << "  plot <x> <y>      light a pixel, x 0..63, y 0..31\n"
+              << "  unplot <x> <y>    turn a pixel off\n"
+              << "  frame             draw a border around the screen\n"
+              << "  rowmin <y>        the leftmost lit pixel in row y\n"
+              << "  sort <lo> <hi> [bubble|insert] [show]\n"
+              << "                    sort the bytes of [lo, hi) in place (bubble);\n"
+              << "                    show: draw them as columns after every pass\n"
+              << "  anim <steps> <frames>\n"
+              << "                    run at most steps steps, then show; frames times\n"
               << "  hostdump cpu      the host's CPU struct as raw bytes\n"
               << "  help              this list\n"
               << "  quit              leave\n";
@@ -347,6 +363,31 @@ int main() {
                 breakpoint = addr;
                 std::cout << "breakpoint at " << hex(static_cast<unsigned>(addr), 4) << '\n';
             }
+        } else if (cmd == "find" && line.find('!') != std::string::npos) {
+            // `find <lo> <hi> !<byte>`: the first byte that is NOT <byte>.
+            // find_not is the same loop as find with != (search.cpp);
+            // `find 0xA00 0xB00 !0` is where the picture on the screen starts.
+            std::string l, h, n, extra;
+            long lo = 0, hi = 0, needle = 0;
+            if (!(words >> l >> h >> n) || words >> extra || n[0] != '!' || !parse_number(l, lo) ||
+                !parse_number(h, hi) || !parse_number(n.substr(1), needle)) {
+                std::cout << "usage: find <lo> <hi> !<byte>\n";
+            } else if (lo < 0 || lo > hi || static_cast<std::size_t>(hi) > MEM_SIZE) {
+                std::cout << "range must be 0 <= lo <= hi <= " << MEM_SIZE << '\n';
+            } else if (needle < 0 || needle > 255) {
+                std::cout << "a byte is 0..255, got " << needle << '\n';
+            } else {
+                const auto from = static_cast<std::uint16_t>(lo),
+                           to = static_cast<std::uint16_t>(hi);
+                const std::uint16_t i = find_not(mem, from, to, static_cast<Byte>(needle));
+                if (i == to)
+                    std::cout << "no byte != " << hex(static_cast<unsigned>(needle), 2) << " in ["
+                              << hex(from, 4) << ", " << hex(to, 4) << ")\n";
+                else
+                    std::cout << "found " << hex(mem_get(mem, i), 2) << " at " << hex(i, 4)
+                              << " (first byte != " << hex(static_cast<unsigned>(needle), 2)
+                              << ")\n";
+            }
         } else if (cmd == "find") {
             // The given C++ loop (search.cpp) over [lo, hi): hi itself is not
             // looked at, and hi == MEM_SIZE means "to the end of the box".
@@ -369,6 +410,110 @@ int main() {
                 else
                     std::cout << "found " << hex(static_cast<unsigned>(needle), 2) << " at "
                               << hex(i, 4) << '\n';
+            }
+        } else if (cmd == "show") {
+            show(mem); // the given show(), the same one SHOW calls
+        } else if (cmd == "cls") {
+            clear(mem);
+        } else if (cmd == "plot" || cmd == "unplot") {
+            // The same plot/unplot as PLOT/UNPLOT; a refused pixel changes nothing.
+            std::string xs, ys, extra;
+            long x = 0, y = 0;
+            if (!(words >> xs >> ys) || words >> extra || !parse_number(xs, x) ||
+                !parse_number(ys, y)) {
+                std::cout << "usage: " << cmd << " <x> <y>\n";
+            } else {
+                // A number too big for an int is off the screen too.
+                const bool fits = x >= INT_MIN && x <= INT_MAX && y >= INT_MIN && y <= INT_MAX;
+                const int xi = fits ? static_cast<int>(x) : -1,
+                          yi = fits ? static_cast<int>(y) : -1;
+                const bool done = cmd == "plot" ? plot(mem, xi, yi) : unplot(mem, xi, yi);
+                if (!done)
+                    std::cout << "pixel (" << x << ", " << y << ") is outside the " << SCREEN_W
+                              << 'x' << SCREEN_H << " screen; nothing changed\n";
+            }
+        } else if (cmd == "frame") {
+            frame(mem);
+        } else if (cmd == "rowmin") {
+            std::string ys, extra;
+            long y = 0;
+            if (!(words >> ys) || words >> extra || !parse_number(ys, y)) {
+                std::cout << "usage: rowmin <y>\n";
+            } else if (y < 0 || y >= SCREEN_H) {
+                std::cout << "row is 0.." << SCREEN_H - 1 << ", got " << y << '\n';
+            } else {
+                const int x = rowmin(mem, static_cast<int>(y));
+                if (x < 0)
+                    std::cout << "row " << y << ": no lit pixels\n";
+                else
+                    std::cout << "row " << y << ": leftmost lit pixel at x=" << x << '\n';
+            }
+        } else if (cmd == "sort") {
+            // In place over [lo, hi), like find's range. The loops are in sort.cpp.
+            std::string l, h, opt;
+            long lo = 0, hi = 0;
+            SortKind kind = SortKind::bubble;
+            bool draw = false, named = false; // each option at most once
+            bool bad = !(words >> l >> h) || !parse_number(l, lo) || !parse_number(h, hi);
+            while (!bad && words >> opt) {
+                if ((opt == "bubble" || opt == "insert") && !named) {
+                    kind = opt == "bubble" ? SortKind::bubble : SortKind::insert;
+                    named = true;
+                } else if (opt == "show" && !draw) {
+                    draw = true;
+                } else {
+                    bad = true;
+                }
+            }
+            if (bad) {
+                std::cout << "usage: sort <lo> <hi> [bubble|insert] [show]\n";
+            } else if (lo < 0 || lo > hi || static_cast<std::size_t>(hi) > MEM_SIZE) {
+                std::cout << "range must be 0 <= lo <= hi <= " << MEM_SIZE << '\n';
+            } else if (draw && (hi - lo < 1 || hi - lo > SCREEN_W)) {
+                // One column per byte: at most one pixel wide each.
+                std::cout << "sort with show needs 1.." << SCREEN_W << " bytes, got " << hi - lo
+                          << '\n';
+            } else if (draw && static_cast<std::size_t>(lo) <= VRAM_HI &&
+                       static_cast<std::size_t>(hi) > VRAM_LO) {
+                // The columns are drawn into VRAM: they would overwrite the bytes.
+                std::cout << "the range overlaps the screen; sort it without show\n";
+            } else {
+                const auto from = static_cast<std::size_t>(lo), to = static_cast<std::size_t>(hi);
+                const SortStats st = sort_range(mem, from, to, kind, draw);
+                std::cout << "sorted [" << hex(static_cast<unsigned>(from), 4) << ", "
+                          << hex(static_cast<unsigned>(to), 4) << ") by "
+                          << (kind == SortKind::bubble ? "bubble" : "insert") << ": " << st.passes
+                          << " passes, " << st.compares << " compares, " << st.swaps << " swaps\n";
+            }
+        } else if (cmd == "anim") {
+            // A game loop for the poor: run at most `steps` steps (the same
+            // run(), so `b` and `trace` count), show the screen, again. With
+            // `b` at the head of the guest's loop a frame is one pass of it.
+            std::string s, f, extra;
+            long steps = 0, frames = 0;
+            if (!(words >> s >> f) || words >> extra || !parse_number(s, steps) ||
+                !parse_number(f, frames) || steps < 1 ||
+                static_cast<unsigned long>(steps) > RUN_STEP_LIMIT || frames < 1 || frames > 1000) {
+                std::cout << "usage: anim <steps 1.." << RUN_STEP_LIMIT << "> <frames 1..1000>\n";
+            } else {
+                for (long k = 1; k <= frames; ++k) {
+                    const RunResult r =
+                        run(cpu, trace, breakpoint, static_cast<unsigned long>(steps));
+                    guest_end_line();
+                    if (r.why == RunStop::halted) {
+                        std::cout << "halted after " << r.steps << " steps\n";
+                        break;
+                    }
+                    if (r.why == RunStop::error) {
+                        report(r.error, cpu);
+                        if (r.error != StepResult::halted)
+                            std::cout << "stopped after " << r.steps << " steps\n";
+                        break;
+                    }
+                    std::cout << "frame " << k << ": " << r.steps << " steps, PC=" << hex(cpu.pc, 4)
+                              << '\n';
+                    show(mem);
+                }
             }
         } else if (cmd == "hostdump") {
             std::string what;

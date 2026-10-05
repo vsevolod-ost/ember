@@ -15,6 +15,8 @@ add_executable(ember
     src/hexdump.cpp
     src/run.cpp
     src/search.cpp
+    src/display.cpp
+    src/sort.cpp
 )
 
 target_compile_options(ember PRIVATE -Wall -Wextra -Werror)

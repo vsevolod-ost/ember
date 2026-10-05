@@ -2,12 +2,12 @@
 // main.cpp prints the reason.
 #include "run.hpp"
 
-RunResult run(CPU& cpu, bool trace, long breakpoint) {
+RunResult run(CPU& cpu, bool trace, long breakpoint, unsigned long limit) {
     unsigned long steps = 0;
     while (true) {
         if (steps > 0 && cpu.pc == breakpoint)
             return {RunStop::breakpoint, StepResult::ok, steps};
-        if (steps == RUN_STEP_LIMIT)
+        if (steps == limit)
             return {RunStop::step_limit, StepResult::ok, steps};
         const StepResult r = step(cpu, trace);
         if (r != StepResult::ok)

@@ -18,6 +18,7 @@ const std::size_t MEM_SIZE = 4096;
 // is expected to put things, not walls.
 const std::size_t CODE_LO = 0x000, CODE_HI = 0x7FF; // PC starts at CODE_LO (Lab 2)
 const std::size_t DATA_LO = 0x800, DATA_HI = 0x9FF; // strings, arrays, counters (Lab 3)
+const std::size_t VRAM_LO = 0xA00, VRAM_HI = 0xAFF; // 64x32 screen, 1 bit per pixel (Lab 5)
 
 struct Memory {
     // The `{}` zero-initializes the whole array.
