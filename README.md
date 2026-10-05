@@ -3322,3 +3322,1322 @@ ember> quit
 | Байт стану | `0xB02` | `STATUS_ADDR` | Лаба 2 (з Лаби 5 — `0xB02`) |
 
 Нових власних опкодів у Лабі 5 немає; `JG`/`JL` (`0x70`/`0x71`) — як у Lab 04. Уточнення рядків ISA: `PLOT`/`UNPLOT` на екрані виставляють `C = 0`; `OUTS` з операндом `>= 4096` — помилка, а рядок, що доходить до `0xFFF`, обривається на краю коробки.
+
+---
+
+# Lab 06 — Іменовані набори: структури, переліки й купа
+
+Нові й змінені команди REPL:
+
+| Команда | Що робить |
+|---|---|
+| `layout [cpu\|flags\|instruction\|sprite\|value]` | зміщення й розмір кожного поля (`offsetof`/`sizeof`), рядки `(padding)` — дірки між полями й у кінці, підсумок `fields N + padding M = sizeof`; без аргументу — усі п'ять структур |
+| `hostdump <cpu\|sprites>` | сирі байти хостової структури `CPU` (як у Lab 03) або масиву `sprites` |
+| `sprite <i> <x> <y> <vx> <vy>` | заповнити спрайт `i` (0..7) і зробити живим: `x` 0..63, `y` 0..31, `vx` −63..63, `vy` −31..31; перемалювати відеопам'ять |
+| `sprite <i> off` | спрайт `i` більше не живий; перемалювати |
+| `sprites` | усі 8 записів |
+| `tick [n]` | `n` разів (1..100, за замовчуванням 1): зсунути всі живі спрайти з відскоком від країв 64×32, перемалювати, `show` |
+| `heap` | стан купи гостя: `heap_ptr`, скільки зайнято й лишилось, список вільних блоків |
+| `alloc <n>` / `free <addr> <n>` | ті самі `heap_alloc`/`heap_free`, що за `ALLOC`/`FREE`, але від імені хоста: регістри й прапорці не чіпають |
+| `value <byte\|addr\|sprite> <n>` | зробити тегований `Value` і надрукувати його за тегом |
+
+Рядок трасування той самий, що в Lab 03–05; нові мнемоніки — `ALLOC` і `FREE`. Нова помилка кроку — `free list is broken at 0x…; nothing done` (див. «Якщо встигаєте»).
+
+## M1 — `enum class Op` і розкладка структур
+
+Вихідної точки лаби — констант `const Byte OP_*` у `cpu.hpp` — у моєму коді не було ніколи: `enum class Op : std::uint8_t` зі значеннями з ISA живе в `src/opcodes.hpp` від Lab 02, і `step` уже тоді перемикався по `Op`. Тож рефакторинг у цій лабі — лише нові рядки (`Alloc`, `Free`) і `struct Instruction` нижче:
+
+```cpp
+enum class Op : std::uint8_t {
+    // 0x0_ — control and output
+    Halt = 0x00,
+    Nop = 0x01,
+
+    // 0x6_ — system (Lab 6)
+    Alloc = 0x60, // H = a new block of A bytes on the guest heap; C = 1: it does not fit
+    // 0x7_ — own extensions (ISA §8: 0x70-0xFF are free), Lab 4 and Lab 6
+    Jg = 0x70,   // jump if A > B as signed bytes (-128..127); flags untouched
+    Jl = 0x71,   // jump if A < B as signed bytes (-128..127); flags untouched
+    Free = 0x72, // own (Lab 6): give [H, H + A) back to the heap; C = 1: refused
+```
+
+```txt
+d9285a0 Lab 02: ALU with Z/N/C flags, CPU step/run/regs, decode by group nibble
+```
+
+`struct CPU` і `struct Flags` — структури з Lab 02. Крок проєкту лаби — «`CPU` і `Instruction` як структури»: `Instruction` — те, що `step` прочитав за `PC` до виконання. Сирий байт стає `Op` рівно в одному місці, у `fetch()`, одразу після того, як `instr_size()` визнав його рядком ISA; далі `switch` (група, потім `Op`), мнемоніка й трасування читають `ins`:
+
+```cpp
+// What step read at PC before executing it: the ISA row and the bytes.
+// `op` is an Op only once instr_size knew the byte.
+struct Instruction {
+    std::uint16_t at;  // its address: PC before the step
+    Op op;             // bytes[0] as an Op
+    Byte size;         // 1..3, the "розмір" column of the ISA
+    Byte bytes[3];     // opcode, then operands; the unused ones are 0
+    std::uint16_t w16; // bytes[1..2] as one value, low byte first (size 3 only)
+};
+```
+
+```cpp
+static StepResult fetch(const Memory& mem, std::size_t at, Instruction& ins) {
+    if (at >= MEM_SIZE)
+        return StepResult::out_of_memory;
+    const Byte op = mem_get(mem, at);
+    const std::uint16_t size = instr_size(op);
+    if (size == 0)
+        return StepResult::bad_opcode;
+    // The one bounds check on the instruction stream: never read an operand
+    // past the last byte of the box.
+    if (at + size > MEM_SIZE)
+        return StepResult::out_of_memory;
+
+    ins.at = static_cast<std::uint16_t>(at);
+    ins.op = static_cast<Op>(op);
+    ins.size = static_cast<Byte>(size);
+    ins.bytes[0] = op;
+    ins.bytes[1] = size > 1 ? mem_get(mem, at + 1) : Byte{0};
+    ins.bytes[2] = size > 2 ? mem_get(mem, at + 2) : Byte{0};
+    ins.w16 = size == 3 ? get16(mem, at + 1) : 0;
+    return StepResult::ok;
+}
+
+StepResult step(CPU& cpu, bool trace) {
+    if (cpu.halted)
+        return StepResult::halted;
+
+    Instruction ins{};
+    const StepResult fetched = fetch(*cpu.mem, cpu.pc, ins);
+    if (fetched != StepResult::ok)
+        return fetched;
+```
+
+Невідомий байт і далі помилка, а не тихий `Nop`: `0x61` — у групі `0x6_`, але рядка немає; `0x73` — у вільному діапазоні, але не наш опкод:
+
+```txt
+ember> set 0 0x61
+ember> step
+unknown opcode 0x61 at 0x0000; nothing done
+ember> set 0 0x73
+ember> step
+unknown opcode 0x73 at 0x0000; nothing done
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> quit
+```
+
+**Поведінка не змінилась.** Файлу `checks/lab-06.txt` немає: перевірка Лаби 6 — усі перевірки Lab 1–5 без змін. Скрипт збирає Lab 05 (коміт `c4eca13`) поруч і проганяє обидві збірки на всіх п'яти файлах перевірок:
+
+```sh
+#!/bin/sh
+# Lab 05 (c4eca13) against the working tree: every check file, both binaries.
+old=$(mktemp -d)
+git archive c4eca13 src CMakeLists.txt | tar -x -C "$old"
+cmake -S "$old" -B "$old/build" -DCMAKE_BUILD_TYPE=Debug > /dev/null
+cmake --build "$old/build" > /dev/null
+for f in docs/checks/lab-01.txt notes-local/lab-0[2-5]/upstream/checks/lab-0?.txt; do
+    "$old/build/ember" < "$f" > "$old/a.out" 2> "$old/a.err"; ea=$?
+    ./build/ember < "$f" > "$old/b.out" 2> "$old/b.err"; eb=$?
+    if cmp -s "$old/a.out" "$old/b.out" && [ ! -s "$old/a.err" ] && [ ! -s "$old/b.err" ] &&
+       [ $ea -eq 0 ] && [ $eb -eq 0 ]; then
+        echo "$(basename "$f"): identical, $(wc -l < "$old/b.out") lines, exit 0, stderr empty"
+    else
+        echo "$(basename "$f"): DIFFERENT (exit $ea/$eb)"
+    fi
+done
+rm -rf "$old"
+```
+
+```txt
+lab-01.txt: identical, 262 lines, exit 0, stderr empty
+lab-02.txt: identical, 7 lines, exit 0, stderr empty
+lab-03.txt: identical, 4 lines, exit 0, stderr empty
+lab-04.txt: identical, 4 lines, exit 0, stderr empty
+lab-05.txt: identical, 35 lines, exit 0, stderr empty
+```
+
+Дві з них — повністю, на поточній збірці. `checks/lab-02.txt`:
+
+```txt
+ember> reg a 200
+ember> reg b 100
+ember> set 0 0x10
+ember> set 1 0x00
+ember> regs
+PC=0x0000  A=200  B=100  H=0x0000  Z=0 N=0 C=0
+ember> step
+0000  10        ADD A, B          -> A= 44  B=100  H=0x0000  Z=0 N=0 C=1
+ember> regs
+PC=0x0001  A=44  B=100  H=0x0000  Z=0 N=0 C=1
+ember> step
+0001  00        HALT              -> A= 44  B=100  H=0x0000  Z=0 N=0 C=1
+ember> step
+halted: step does nothing after HALT
+ember> regs
+PC=0x0002  A=44  B=100  H=0x0000  Z=0 N=0 C=1
+ember> quit
+```
+
+`checks/lab-04.txt` (відлік `3 2 1`):
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x03
+ember> set 2 0x03
+ember> set 3 0x19
+ember> set 4 0x32
+ember> set 5 0x02
+ember> set 6 0x00
+ember> set 7 0x00
+ember> run
+3 2 1 
+halted after 11 steps
+ember> regs
+PC=0x0008  A=0  B=0  H=0x0000  Z=1 N=0 C=0
+ember> quit
+```
+
+### `sizeof(CPU)` і вирівнювальні байти
+
+```cpp
+struct CPU {
+    Memory* mem;
+    std::uint16_t pc = 0; // address of the NEXT instruction
+    std::uint16_t h = 0;  // address register: where LOAD A, [H] reads
+    Byte a = 0, b = 0;
+    Flags f{};
+    bool halted = false; // set by HALT; every later step refuses
+    Byte ticks = 0;      // instructions executed, mod 256 (the guest reads it at TICKS)
+    // The guest heap (Lab 6), not registers: `regs` does not show them.
+    // heap_ptr needs an even address, so one padding byte sits before it.
+    std::uint16_t heap_ptr = HEAP_LO; // the next fresh block starts here (ALLOC)
+    std::uint16_t free_head = 0;      // first block of the free list (FREE); 0 = none
+};
+```
+
+```txt
+ember> layout cpu
+CPU: sizeof=24 alignof=8
+  off size field
+    0    8 mem
+    8    2 pc
+   10    2 h
+   12    1 a
+   13    1 b
+   14    3 f (Flags)
+   17    1 halted
+   18    1 ticks
+   19    1 (padding)
+   20    2 heap_ptr
+   22    2 free_head
+  fields 23 + padding 1 = 24
+ember> layout flags
+Flags: sizeof=3 alignof=1
+  off size field
+    0    1 z
+    1    1 n
+    2    1 c
+  fields 3 + padding 0 = 3
+ember> layout instruction
+Instruction: sizeof=10 alignof=2
+  off size field
+    0    2 at
+    2    1 op (Op)
+    3    1 size
+    4    3 bytes[3]
+    7    1 (padding)
+    8    2 w16
+  fields 9 + padding 1 = 10
+ember> reg a 0x41
+ember> reg b 0x42
+ember> reg h 0x0800
+ember> reg pc 0x0123
+ember> hostdump cpu
+&cpu=0x7b93b86f10a0  sizeof(cpu)=24  sizeof(cpu.mem)=8  sizeof(*cpu.mem)=4096
+0000  20 00 6f b8 93 7b 00 00 23 01 00 08 41 42 00 00  | .o..{..#...AB..|
+0010  00 00 00 00 00 0c 00 00                          |........|
+ember> quit
+```
+
+**`sizeof(CPU)` = 24**: полів 23 байти, один вирівнювальний байт на зміщенні 19. `heap_ptr` — `std::uint16_t`, йому потрібна парна адреса, а після `ticks` (зміщення 18) вільне непарне 19, тож компілятор пропускає байт. Хвоста немає: `CPU` містить `Memory*` (вирівнювання 8), тому `sizeof(CPU)` кратний 8, а 24 уже кратне. `Flags` — три `bool`, 3 байти без дірок. В `Instruction` дірка на 7: три байти `bytes` закінчуються на непарній адресі, а `w16` має стати на парну. У `hostdump cpu` це четвертий байт другого рядка дампу (зміщення `0x13` = 19), одразу перед `00 0c` (`heap_ptr = 0x0C00`, молодший байт уперед). Зараз там `00`, але значення таких байтів стандарт не гарантує: де дірки — кажуть `offsetof`/`sizeof` (`layout`), дамп лише показує, де вони лежать.
+
+## M2 — спрайти
+
+`struct Sprite` — даний код теорії §1, у `src/sprite.hpp`; масив — `Sprite sprites[SPRITE_COUNT]{};` у `main` поруч із `CPU cpu` (`SPRITE_COUNT = 8`, `{}` занулює всі записи, тож усі мертві):
+
+```cpp
+struct Sprite {
+    std::uint8_t x, y;
+    std::int8_t vx, vy;
+    bool alive;
+};
+```
+
+Рух однієї осі: `pos + v` рахується в `int` (`63 + 63` не влазить в `int8_t`); вийшли за край — віддзеркалити позицію й обернути швидкість; опинились рівно на краю, летячи назовні, — обернути одразу (правило notes §5: на краю швидкість змінює знак). Швидкості обмежені 63/31, тож одного відбиття завжди досить:
+
+```cpp
+// One axis: pos + v, mirrored at 0 and at `last` (63 for x, 31 for y).
+// Counted in int: 63 + 63 does not fit in an int8_t, and must not wrap.
+static void move_axis(std::uint8_t& pos, std::int8_t& v, int last) {
+    int p = pos + v, nv = v;
+    if (p < 0) { // past the left/top edge: as far back inside
+        p = -p;
+        nv = -nv;
+    } else if (p > last) { // past the right/bottom edge
+        p = 2 * last - p;
+        nv = -nv;
+    }
+    // Exactly on an edge and still heading out: turn now (notes §5: on the
+    // edge the speed flips), so the next tick moves inside.
+    if ((p == 0 && nv < 0) || (p == last && nv > 0))
+        nv = -nv;
+    pos = static_cast<std::uint8_t>(p);
+    v = static_cast<std::int8_t>(nv); // -63..63: fits, nothing is cut
+}
+
+void sprite_move(Sprite& s) {
+    move_axis(s.x, s.vx, SCREEN_W - 1);
+    move_axis(s.y, s.vy, SCREEN_H - 1);
+}
+```
+
+`tick`: зсунути всіх живих, `clear` + `plot` кожного живого (екран — картинка масиву записів; усе інше з екрана стирається), даний `show()`. Два спрайти біля протилежних кутів, обидва летять у кут і на першому ж тіку відскакують — `(1, 30)` → `(0, 31)` → `(1, 30)`, `(62, 1)` → `(63, 0)` → `(62, 1)`. `Sprite` — 5 байтів без дірок, масив — 8 записів по 5 байтів підряд (`vx = -1` у дампі — `ff`):
+
+```txt
+ember> layout sprite
+Sprite: sizeof=5 alignof=1
+  off size field
+    0    1 x
+    1    1 y
+    2    1 vx
+    3    1 vy
+    4    1 alive
+  fields 5 + padding 0 = 5
+ember> sprite 0 1 30 -1 1
+sprite 0: x=1 y=30 vx=-1 vy=1 alive
+ember> sprite 1 62 1 1 -1
+sprite 1: x=62 y=1 vx=1 vy=-1 alive
+ember> sprites
+sprite 0: x=1 y=30 vx=-1 vy=1 alive
+sprite 1: x=62 y=1 vx=1 vy=-1 alive
+sprite 2: x=0 y=0 vx=0 vy=0 dead
+sprite 3: x=0 y=0 vx=0 vy=0 dead
+sprite 4: x=0 y=0 vx=0 vy=0 dead
+sprite 5: x=0 y=0 vx=0 vy=0 dead
+sprite 6: x=0 y=0 vx=0 vy=0 dead
+sprite 7: x=0 y=0 vx=0 vy=0 dead
+ember> hostdump sprites
+&sprites=0x7b2a3f6f10e0  sizeof(sprites)=40  sizeof(Sprite)=5
+0000  01 1e ff 01 01 3e 01 01 ff 01 00 00 00 00 00 00  |.....>..........|
+0010  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+0020  00 00 00 00 00 00 00 00                          |........|
+ember> tick 3
+tick 1: 2 alive
+...............................................................#
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+#...............................................................
+tick 2: 2 alive
+................................................................
+..............................................................#.
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+.#..............................................................
+................................................................
+tick 3: 2 alive
+................................................................
+................................................................
+.............................................................#..
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+................................................................
+..#.............................................................
+................................................................
+................................................................
+ember> quit
+```
+
+Помилки нічого не змінюють; `sprite <i> off` лишає запис, але гасить його:
+
+```txt
+ember> sprite 8 0 0 1 1
+sprite index is 0..7, got 8
+ember> sprite 0 64 0 1 1
+x is 0..63, got 64
+ember> sprite 0 0 32 1 1
+y is 0..31, got 32
+ember> sprite 0 0 0 64 0
+vx is -63..63, got 64
+ember> sprite 0 0 0 0 -32
+vy is -31..31, got -32
+ember> sprite 0 1 2
+usage: sprite <i> <x> <y> <vx> <vy> | sprite <i> off
+ember> tick 101
+usage: tick [1..100]
+ember> sprite 0 10 5 3 -2
+sprite 0: x=10 y=5 vx=3 vy=-2 alive
+ember> sprite 0 off
+sprite 0: x=10 y=5 vx=3 vy=-2 dead
+ember> sprites
+sprite 0: x=10 y=5 vx=3 vy=-2 dead
+sprite 1: x=0 y=0 vx=0 vy=0 dead
+sprite 2: x=0 y=0 vx=0 vy=0 dead
+sprite 3: x=0 y=0 vx=0 vy=0 dead
+sprite 4: x=0 y=0 vx=0 vy=0 dead
+sprite 5: x=0 y=0 vx=0 vy=0 dead
+sprite 6: x=0 y=0 vx=0 vy=0 dead
+sprite 7: x=0 y=0 vx=0 vy=0 dead
+ember> quit
+```
+
+## M3 — `new`/`delete` на хості, свідомо
+
+**Шлях — Linux** (ця машина): тут LeakSanitizer є, тож для витоку вставляю справжній звіт, а не пояснення. Тимчасовий `scratch.cpp` жив у тимчасовому каталозі поза репозиторієм; у git його немає, нижче — кожен фрагмент повністю. Компілятор — GCC 16.2.1 (`c++`), рядок із Notes 01 плюс `-g`, щоб у звіті був `scratch.cpp:рядок` (clang 22 дає звіти того самого вигляду). Запуск через `script` (псевдотермінал), щоб рядок `42`, надрукований до звіту, не загубився в буфері; `ASAN_OPTIONS=color=never` — без кольорових кодів; для витоку — `ASAN_OPTIONS=color=never:detect_leaks=1`, як у notes §4 (на Linux і так увімкнено):
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g scratch.cpp -o scratch
+ASAN_OPTIONS=color=never script -q -e -c ./scratch /dev/null
+```
+
+У звітах обрізано тільки кадри стека з `libc` і `_start` (позначено `…`) і все після рядка `SUMMARY` (карту тіньових байтів); решта — як надрукувалось.
+
+### Витік (`new` і забути)
+
+```cpp
+int main() {
+    new int{1};   // забули вказівник
+}
+```
+
+```txt
+
+=================================================================
+==925541==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 4 byte(s) in 1 object(s) allocated from:
+    #0 0x7f5c5a32d2a1 in operator new(unsigned long) (/usr/lib/libasan.so.8+0x12d2a1) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x56296df8f1bb in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/leak/scratch.cpp:2
+    … (кадри libc і _start обрізано)
+
+SUMMARY: AddressSanitizer: 4 byte(s) leaked in 1 allocation(s).
+```
+
+Код виходу 1. Висновок: об'єкт на 4 байти в купі живий до кінця програми, а єдиний вказівник на нього (результат `new`) ніде не збережено — звільнити його вже нікому.
+
+Виправлення — зберегти вказівник і звільнити (або віддати його `std::unique_ptr`, див. «Якщо встигаєте»):
+
+```cpp
+int main() {
+    int* p = new int{1};   // keep the pointer
+    delete p;
+}
+```
+
+Вивід порожній, код виходу 0. Те саме з `std::make_unique<int>(1)` замість `new`/`delete` — теж порожньо, код 0.
+
+### Читання після звільнення
+
+```cpp
+#include <iostream>
+int main() {
+    int* p = new int{42};
+    std::cout << *p << '\n';
+    delete p;
+    std::cout << *p << '\n';   // dangling
+}
+```
+
+```txt
+42
+=================================================================
+==925533==ERROR: AddressSanitizer: heap-use-after-free on address 0x7b3f6f7e0010 at pc 0x55e835e16534 bp 0x7ffe9bd6dbb0 sp 0x7ffe9bd6dba0
+READ of size 4 at 0x7b3f6f7e0010 thread T0
+    #0 0x55e835e16533 in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/uaf/scratch.cpp:6
+    … (кадри libc і _start обрізано)
+
+0x7b3f6f7e0010 is located 0 bytes inside of 4-byte region [0x7b3f6f7e0010,0x7b3f6f7e0014)
+freed by thread T0 here:
+    #0 0x7f1f7172e421 in operator delete(void*, unsigned long) (/usr/lib/libasan.so.8+0x12e421) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x55e835e163fb in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/uaf/scratch.cpp:5
+    … (кадри libc і _start обрізано)
+
+previously allocated by thread T0 here:
+    #0 0x7f1f7172d2a1 in operator new(unsigned long) (/usr/lib/libasan.so.8+0x12d2a1) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x55e835e1620b in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/uaf/scratch.cpp:3
+    … (кадри libc і _start обрізано)
+
+SUMMARY: AddressSanitizer: heap-use-after-free /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/uaf/scratch.cpp:6 in main
+```
+
+Код виходу 1. Висновок: перше читання (`42`) законне, друге (рядок 6) читає 4 байти, які `delete` у рядку 5 уже повернув купі, — ASan показує, де пам'ять звільнили й де виділили.
+
+Виправлення — читати, поки об'єкт живий, а після `delete` занулити вказівник:
+
+```cpp
+#include <iostream>
+int main() {
+    int* p = new int{42};
+    std::cout << *p << '\n';
+    std::cout << *p << '\n';   // read while the object is alive
+    delete p;
+    p = nullptr;               // no dangling pointer left
+}
+```
+
+```txt
+42
+42
+```
+
+Звіту немає, код виходу 0.
+
+### Подвійне звільнення
+
+```cpp
+#include <iostream>
+int main() {
+    int* p = new int{42};
+    std::cout << *p << '\n';
+    delete p;
+    delete p;
+}
+```
+
+```txt
+42
+=================================================================
+==925537==ERROR: AddressSanitizer: attempting double-free on 0x7b76697e0010 in thread T0:
+    #0 0x7f566b72e421 in operator delete(void*, unsigned long) (/usr/lib/libasan.so.8+0x12e421) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x55be3b506411 in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/df/scratch.cpp:6
+    … (кадри libc і _start обрізано)
+
+0x7b76697e0010 is located 0 bytes inside of 4-byte region [0x7b76697e0010,0x7b76697e0014)
+freed by thread T0 here:
+    #0 0x7f566b72e421 in operator delete(void*, unsigned long) (/usr/lib/libasan.so.8+0x12e421) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x55be3b5063fb in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/df/scratch.cpp:5
+    … (кадри libc і _start обрізано)
+
+previously allocated by thread T0 here:
+    #0 0x7f566b72d2a1 in operator new(unsigned long) (/usr/lib/libasan.so.8+0x12d2a1) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x55be3b50620b in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/df/scratch.cpp:3
+    … (кадри libc і _start обрізано)
+
+SUMMARY: AddressSanitizer: double-free /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/m3/df/scratch.cpp:6 in main
+```
+
+Код виходу 1. Висновок: другий `delete` (рядок 6) віддає купі блок, який вона вже отримала в рядку 5, — ASan ловить це на самому `delete`, ще до того, як алокатор зіпсує свої списки.
+
+Виправлення — один `delete` на один `new`; після нього `p = nullptr`, і випадковий другий `delete` стає безпечним (`delete nullptr` нічого не робить):
+
+```cpp
+#include <iostream>
+int main() {
+    int* p = new int{42};
+    std::cout << *p << '\n';
+    delete p;
+    p = nullptr;
+    delete p;                  // delete of nullptr does nothing
+}
+```
+
+```txt
+42
+```
+
+Звіту немає, код виходу 0.
+
+## Карта пам'яті
+
+Рамка — з ISA §2; у запасі підписані наші адреси, у купі — вказівник.
+
+```txt
+0x000 ┌─────────────────────────────┐
+      │  CODE                       │  2048 байтів
+      │  ваша програма; PC стартує  │  тут живуть інструкції
+      │  саме звідси                │
+0x800 ├─────────────────────────────┤
+      │  DATA                       │  512 байтів
+      │  рядки, масиви, лічильники  │
+0xA00 ├─────────────────────────────┤
+      │  VRAM   64 x 32, біт/піксель│  256 байтів  <- екран ЦЕ пам'ять
+0xB00 ├─────────────────────────────┤
+      │  (запас — ваш)              │  256 байтів
+      │  0xB00 PORT_OUT  0xB01 TICKS│  0xB02 байт стану
+0xC00 ├─────────────────────────────┤
+      │  HEAP     ▼ до старших адрес│  768 байтів
+      │                             │  ALLOC відрізає блоки вгору від 0xC00
+      │  heap_ptr = наступний блок  │  FREE (0x72): список вільних блоків
+0xF00 ├─────────────────────────────┤
+      │  STACK    ▲ до молодших     │  256 байтів
+      │                             │  SP стартує з 0xFFF і йде вниз
+0xFFF └─────────────────────────────┘
+```
+
+| Регіон | Діапазон | Константа | З'являється в |
+|---|---|---|---|
+| Код | `0x000`–`0x7FF` | `CODE_LO`, `CODE_HI` | Lab 2 |
+| Дані | `0x800`–`0x9FF` | `DATA_LO`, `DATA_HI` | Lab 3 |
+| Відеопам'ять | `0xA00`–`0xAFF` | `VRAM_LO`, `VRAM_HI` | Lab 5 |
+| Запас | `0xB00`–`0xBFF` | — | — |
+| ↳ порт виводу | `0xB00` | `PORT_OUT` | Lab 5 (*opt*) |
+| ↳ таймер | `0xB01` | `TICKS` | Lab 5 (*opt*) |
+| ↳ байт стану (власне розширення) | `0xB02` | `STATUS_ADDR` | Lab 2 (з Lab 5 — `0xB02`) |
+| **Купа** | `0xC00`–`0xEFF` | `HEAP_LO`, `HEAP_HI` | Lab 6 |
+| Стек | `0xF00`–`0xFFF` | `STACK_LO`, `STACK_HI` | Lab 7 |
+
+Константи в `src/memory.hpp` (`STACK_*` оголошені наперед, вживатиме Lab 07; `PORT_OUT`, `TICKS`, `STATUS_ADDR` — у `src/cpu.hpp`):
+
+```cpp
+const std::size_t CODE_LO = 0x000, CODE_HI = 0x7FF; // PC starts at CODE_LO (Lab 2)
+const std::size_t DATA_LO = 0x800, DATA_HI = 0x9FF; // strings, arrays, counters (Lab 3)
+const std::size_t VRAM_LO = 0xA00, VRAM_HI = 0xAFF; // 64x32 screen, 1 bit per pixel (Lab 5)
+const std::size_t HEAP_LO = 0xC00, HEAP_HI = 0xEFF; // guest heap: ALLOC cuts blocks upwards (Lab 6)
+const std::size_t STACK_LO = 0xF00, STACK_HI = 0xFFF; // SP starts at STACK_HI and goes down (Lab 7)
+```
+
+## Advanced
+
+### Купа гостя: `ALLOC`
+
+`CPU::heap_ptr` (`std::uint16_t`, стартує з `HEAP_LO`) — вершина купи; у `regs` його немає (це не регістр ISA), його видно в `heap`, `layout cpu` і `hostdump cpu`. `ALLOC` (`0x60`): блок влазить, якщо `heap_ptr + A <= HEAP_HI + 1` (блок може закінчитись рівно на `0xEFF`; рахується в `size_t`, без обрізання до 16 бітів). Влізло — `H = heap_ptr`, `heap_ptr += A`, `C = 0`; не влізло — `C = 1`, `H` і `heap_ptr` не змінюються. `Z`, `N`, `A`, `B` `ALLOC` не чіпає; `PC += 1` в обох випадках — це не помилка кроку, як `PLOT` за екраном. `A = 0` — буквально за формулою ISA: 0 байтів влазять завжди, `H = heap_ptr`, нічого не посувається.
+
+```cpp
+    case 0x6:
+        // The guest heap (heap.cpp). Not fitting is no error of the step:
+        // C = 1 and H stays. Z, N, A and B are never touched.
+        switch (ins.op) {
+        case Op::Alloc:
+            hr = heap_alloc(cpu, cpu.a, block, flag);
+            if (hr == HeapResult::broken_list)
+                return StepResult::bad_heap;
+            if (hr == HeapResult::ok)
+                cpu.h = block;
+            cpu.f.c = hr != HeapResult::ok;
+            break;
+        default:
+            return StepResult::bad_opcode;
+        }
+        break;
+
+    // Bump, as in the ISA. The block may end on HEAP_HI itself; counted in
+    // size_t, so heap_ptr + n is never cut to 16 bits.
+    if (static_cast<std::size_t>(cpu.heap_ptr) + n > HEAP_HI + 1)
+        return HeapResult::no_room;
+    at = cpu.heap_ptr;
+    cpu.heap_ptr = static_cast<std::uint16_t>(cpu.heap_ptr + n);
+    return HeapResult::ok;
+```
+
+Трасування з DEFENSE (T4): 16, 32, потім тричі 255:
+
+```txt
+адр.  байти       текст
+0000  20 10       LOADI A, 0x10     ; 16
+0002  60          ALLOC
+0003  20 20       LOADI A, 0x20     ; 32
+0005  60          ALLOC
+0006  20 FF       LOADI A, 0xFF     ; 255
+0008  60          ALLOC
+0009  60          ALLOC
+000A  60          ALLOC             ; не влізло
+000B  00          HALT
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x10
+ember> set 2 0x60
+ember> set 3 0x20
+ember> set 4 0x20
+ember> set 5 0x60
+ember> set 6 0x20
+ember> set 7 0xFF
+ember> set 8 0x60
+ember> set 9 0x60
+ember> set 10 0x60
+ember> set 11 0x00
+ember> trace on
+ember> run
+0000  20 10     LOADI A, 0x10     -> A= 16  B=  0  H=0x0000  Z=0 N=0 C=0
+0002  60        ALLOC             -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+0003  20 20     LOADI A, 0x20     -> A= 32  B=  0  H=0x0c00  Z=0 N=0 C=0
+0005  60        ALLOC             -> A= 32  B=  0  H=0x0c10  Z=0 N=0 C=0
+0006  20 ff     LOADI A, 0xff     -> A=255  B=  0  H=0x0c10  Z=0 N=0 C=0
+0008  60        ALLOC             -> A=255  B=  0  H=0x0c30  Z=0 N=0 C=0
+0009  60        ALLOC             -> A=255  B=  0  H=0x0d2f  Z=0 N=0 C=0
+000a  60        ALLOC             -> A=255  B=  0  H=0x0d2f  Z=0 N=0 C=1
+000b  00        HALT              -> A=255  B=  0  H=0x0d2f  Z=0 N=0 C=1
+halted after 9 steps
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0e2e, 558 used, 210 left
+free list: empty
+ember> quit
+```
+
+`0xE2E + 255 = 0xF2D > 0xF00` — п'ятий `ALLOC` не влазить: `C = 1`, `H` лишився `0x0D2F`, `heap_ptr` — `0x0E2E`.
+
+### Дамп після двох виділень
+
+Сам `ALLOC` пам'ять не пише, тож програма заповнює кожен блок через `H`: перший (4 байти) — `'A'`, другий (3 байти) — `'B'`:
+
+```txt
+адр.  байти       текст
+0000  20 04       LOADI A, 0x04
+0002  60          ALLOC             ; H = блок 1
+0003  20 41       LOADI A, 0x41     ; 'A'
+0005  2A          STORE [H], A
+0006  2B          INCH
+0007  2A          STORE [H], A
+0008  2B          INCH
+0009  2A          STORE [H], A
+000A  2B          INCH
+000B  2A          STORE [H], A
+000C  20 03       LOADI A, 0x03
+000E  60          ALLOC             ; H = блок 2
+000F  20 42       LOADI A, 0x42     ; 'B'
+0011  2A          STORE [H], A
+0012  2B          INCH
+0013  2A          STORE [H], A
+0014  2B          INCH
+0015  2A          STORE [H], A
+0016  00          HALT
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x04
+ember> set 2 0x60
+ember> set 3 0x20
+ember> set 4 0x41
+ember> set 5 0x2A
+ember> set 6 0x2B
+ember> set 7 0x2A
+ember> set 8 0x2B
+ember> set 9 0x2A
+ember> set 10 0x2B
+ember> set 11 0x2A
+ember> set 12 0x20
+ember> set 13 0x03
+ember> set 14 0x60
+ember> set 15 0x20
+ember> set 16 0x42
+ember> set 17 0x2A
+ember> set 18 0x2B
+ember> set 19 0x2A
+ember> set 20 0x2B
+ember> set 21 0x2A
+ember> set 22 0x00
+ember> trace on
+ember> run
+0000  20 04     LOADI A, 0x04     -> A=  4  B=  0  H=0x0000  Z=0 N=0 C=0
+0002  60        ALLOC             -> A=  4  B=  0  H=0x0c00  Z=0 N=0 C=0
+0003  20 41     LOADI A, 0x41     -> A= 65  B=  0  H=0x0c00  Z=0 N=0 C=0
+0005  2a        STORE [H], A      -> A= 65  B=  0  H=0x0c00  Z=0 N=0 C=0
+0006  2b        INCH              -> A= 65  B=  0  H=0x0c01  Z=0 N=0 C=0
+0007  2a        STORE [H], A      -> A= 65  B=  0  H=0x0c01  Z=0 N=0 C=0
+0008  2b        INCH              -> A= 65  B=  0  H=0x0c02  Z=0 N=0 C=0
+0009  2a        STORE [H], A      -> A= 65  B=  0  H=0x0c02  Z=0 N=0 C=0
+000a  2b        INCH              -> A= 65  B=  0  H=0x0c03  Z=0 N=0 C=0
+000b  2a        STORE [H], A      -> A= 65  B=  0  H=0x0c03  Z=0 N=0 C=0
+000c  20 03     LOADI A, 0x03     -> A=  3  B=  0  H=0x0c03  Z=0 N=0 C=0
+000e  60        ALLOC             -> A=  3  B=  0  H=0x0c04  Z=0 N=0 C=0
+000f  20 42     LOADI A, 0x42     -> A= 66  B=  0  H=0x0c04  Z=0 N=0 C=0
+0011  2a        STORE [H], A      -> A= 66  B=  0  H=0x0c04  Z=0 N=0 C=0
+0012  2b        INCH              -> A= 66  B=  0  H=0x0c05  Z=0 N=0 C=0
+0013  2a        STORE [H], A      -> A= 66  B=  0  H=0x0c05  Z=0 N=0 C=0
+0014  2b        INCH              -> A= 66  B=  0  H=0x0c06  Z=0 N=0 C=0
+0015  2a        STORE [H], A      -> A= 66  B=  0  H=0x0c06  Z=0 N=0 C=0
+0016  00        HALT              -> A= 66  B=  0  H=0x0c06  Z=0 N=0 C=0
+halted after 19 steps
+ember> dump 0xC00 16
+0c00  41 41 41 41 42 42 42 00 00 00 00 00 00 00 00 00  |AAAABBB.........|
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c07, 7 used, 761 left
+free list: empty
+ember> quit
+```
+
+`AAAABBB` — без дірки: `ALLOC` віддає `H = heap_ptr` і одразу `heap_ptr += A`, тож наступний блок починається рівно там, де закінчився попередній. Перед блоком немає заголовка (розміру ніде не записано), а байтам вирівнювання не потрібне — проміжку нізвідки взятись. Щоб став можливим `FREE`, довелось би десь зберігати розмір кожного блока (у заголовку перед ним — тоді дірка з'явилась би — або в самій інструкції `FREE`) і пам'ятати, які шматки вільні: список вільних блоків. Як я це зробив — у «Якщо встигаєте».
+
+### `FREE` немає — і що це коштує
+
+У ISA `FREE` немає: bump-алокатор уміє рухатись тільки вперед. Пам'ять, віддана `ALLOC`, не повертається до кінця програми (у `ember` — до перезапуску): програма, яка в циклі бере тимчасові блоки, рано чи пізно вичерпає 768 байтів і отримає `C = 1`, хоча майже всі її блоки давно не потрібні. Окремого об'єкта не звільнити, лише все разом. Натомість `ALLOC` — одне порівняння й одне додавання (O(1)), без метаданих і без фрагментації, з наперед відомим часом виконання; тому прошивки з правилами на кшталт MISRA C, де `malloc`/`free` заборонені, тримають саме такі пули, що тільки ростуть.
+
+Справжній звіт про витік на Linux — у M3; тегований `Value` і `FREE` через список вільних блоків — нижче (зроблено обидва).
+
+## Якщо встигаєте
+
+### `FREE` через список вільних блоків
+
+Власний опкод `FREE` (`0x72`, рядок — у «Власних розширеннях»). Рішення:
+
+- **Розмір каже гість.** `FREE` повертає блок `[H, H + A)`, де `A` — той самий розмір, що просили в `ALLOC` (як `operator delete(void*, std::size_t)`). Заголовок із розміром перед блоком неможливий: ISA вимагає свіжі блоки без дірок (T4: 16 байтів на `0xC00` → наступний на `0xC10`). Ціна: гість, що збрехав про розмір, зіпсує купу, і `ember` не завжди це помітить.
+- **Список — у пам'яті гостя, усередині звільнених блоків.** Перші 3 байти вільного блока — вузол: адреса наступного вільного блока (16 бітів, молодший уперед, `0` — кінець) і розмір цього. Голова — `CPU::free_head` (`0` — порожньо). Новий вузол стає в голову. Звідси мінімум: не верхній блок, менший за 3 байти, звільнити не можна (`C = 1`).
+- **Верхній блок** (`H + A == heap_ptr`) не потрапляє в список: `heap_ptr` опускається до `H`, а за ним — через усі вільні блоки, що тепер закінчуються на `heap_ptr`. Звільнили все — `heap_ptr` знову `0xC00`.
+- **`ALLOC` при непорожньому списку** спершу шукає там (first fit): вузол рівно на `A` байтів виймається зі списку, більший щонайменше на 3 байти віддає свій **хвіст** (вузол лишається на місці зі зменшеним розміром — посилань переписувати не треба). Інакше — bump за ISA. Програма без `0x72` бачить чистий bump.
+- **Помилки — `C = 1`, нічого не змінено:** `A = 0`; блок не з зайнятої частини купи; блок перетинається з вільним (**повторне звільнення** — гостьовий аналог `attempting double-free`); не верхній і менший за 3 байти. `H` і `A` після `FREE` не змінюються: `H` тепер — завислий вказівник гостя.
+- **Зіпсований список.** Гість, що пише у звільнений блок через старий `H`, псує вузол. Кожен обхід списку перевіряє вузли (адреса в зайнятій частині купи, розмір щонайменше 3 і не за `heap_ptr`, жоден вузол двічі — інакше петля); порушено — крок відмовляє: `free list is broken at 0x…; nothing done`, `run` зупиняється (як `free(): corrupted …` у glibc). Перевірка йде першою, до будь-яких змін, і для `ALLOC`, і для `FREE`.
+- **Чого немає:** сусідні вільні блоки не зливаються — пам'ять може фрагментуватись (два вільні по 8 байтів не дадуть блок на 16).
+
+Вузли читаються й пишуться через ті самі `guest_read`/`guest_write`, що й `LOAD`/`STORE` гостя:
+
+```cpp
+HeapResult heap_free(CPU& cpu, std::uint16_t at, Byte n, bool& top) {
+    top = false;
+    // The list first, as in ALLOC: a broken one is reported whatever the
+    // block is, so the same FREE never stops one run and not another.
+    std::uint16_t bad = 0;
+    if (!heap_check(cpu, bad))
+        return HeapResult::broken_list;
+    if (n == 0 || at < HEAP_LO || at + n > cpu.heap_ptr)
+        return HeapResult::bad_block;
+    // A block that overlaps a free one was freed already (or never was a block).
+    for (std::uint16_t node = cpu.free_head; node != 0; node = node_next(cpu, node)) {
+        if (node < at + n && at < node + node_size(cpu, node))
+            return HeapResult::already_free;
+    }
+
+    if (at + n == cpu.heap_ptr) {
+        // The top block: heap_ptr comes down to it. Free blocks that now end
+        // at heap_ptr are not between used ones any more: down past them too.
+        top = true;
+        cpu.heap_ptr = at;
+        bool lowered = true;
+        while (lowered) {
+            lowered = false;
+            for (std::uint16_t prev = 0, node = cpu.free_head; node != 0;
+                 prev = node, node = node_next(cpu, node)) {
+                if (node + node_size(cpu, node) == cpu.heap_ptr) {
+                    take_out(cpu, prev, node);
+                    cpu.heap_ptr = node;
+                    lowered = true;
+                    break;
+                }
+            }
+        }
+        return HeapResult::ok;
+    }
+
+    if (n < NODE_SIZE)
+        return HeapResult::too_small;
+    // Any other block: a node at its start, pushed on the head of the list.
+    // The rest of its bytes stay as they were.
+    set_next(cpu, at, cpu.free_head);
+    set_size(cpu, at, n);
+    cpu.free_head = at;
+    return HeapResult::ok;
+}
+```
+
+Звільнити, звільнити вдруге, взяти знову (точка зупину перед другим `FREE`, щоб показати вузол: `00 00` — кінець списку, `10` — 16 байтів):
+
+```txt
+адр.  байти       текст
+0000  20 10       LOADI A, 0x10
+0002  60          ALLOC             ; 0x0C00
+0003  20 08       LOADI A, 0x08
+0005  60          ALLOC             ; 0x0C10
+0006  20 04       LOADI A, 0x04
+0008  60          ALLOC             ; 0x0C18
+0009  28 00 0C    LOADH H, 0x0C00
+000C  20 10       LOADI A, 0x10
+000E  72          FREE              ; [0x0C00, +16) -> список
+000F  72          FREE              ; той самий блок ще раз
+0010  60          ALLOC             ; A = 16: зі списку
+0011  00          HALT
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x10
+ember> set 2 0x60
+ember> set 3 0x20
+ember> set 4 0x08
+ember> set 5 0x60
+ember> set 6 0x20
+ember> set 7 0x04
+ember> set 8 0x60
+ember> set 9 0x28
+ember> set 10 0x00
+ember> set 11 0x0C
+ember> set 12 0x20
+ember> set 13 0x10
+ember> set 14 0x72
+ember> set 15 0x72
+ember> set 16 0x60
+ember> set 17 0x00
+ember> trace on
+ember> b 0x0F
+breakpoint at 0x000f
+ember> run
+0000  20 10     LOADI A, 0x10     -> A= 16  B=  0  H=0x0000  Z=0 N=0 C=0
+0002  60        ALLOC             -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+0003  20 08     LOADI A, 0x08     -> A=  8  B=  0  H=0x0c00  Z=0 N=0 C=0
+0005  60        ALLOC             -> A=  8  B=  0  H=0x0c10  Z=0 N=0 C=0
+0006  20 04     LOADI A, 0x04     -> A=  4  B=  0  H=0x0c10  Z=0 N=0 C=0
+0008  60        ALLOC             -> A=  4  B=  0  H=0x0c18  Z=0 N=0 C=0
+0009  28 00 0c  LOADH H, 0x0c00   -> A=  4  B=  0  H=0x0c00  Z=0 N=0 C=0
+000c  20 10     LOADI A, 0x10     -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+000e  72        FREE              -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+breakpoint at 0x000f
+stopped after 9 steps
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c1c, 28 used, 740 left
+free list: 0x0c00 (16 bytes) -> end
+ember> dump 0xC00 16
+0c00  00 00 10 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+ember> run
+000f  72        FREE              -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=1
+0010  60        ALLOC             -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+0011  00        HALT              -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+halted after 3 steps
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c1c, 28 used, 740 left
+free list: empty
+ember> quit
+```
+
+Повторний `FREE` — `C = 1`, список не змінився; `ALLOC` на 16 узяв блок зі списку, і `heap_ptr` лишився `0x0C1C`. Це свідоме уточнення ISA: блок зі списку бере `H` з-під вершини, тож «вказівник купи посувається» стосується тільки bump.
+
+Верхній блок опускає `heap_ptr`, а за ним — вільний блок `0x0C00`, що тепер закінчується на вершині:
+
+```txt
+адр.  байти       текст
+0000  20 10       LOADI A, 0x10
+0002  60          ALLOC             ; 0x0C00
+0003  20 08       LOADI A, 0x08
+0005  60          ALLOC             ; 0x0C10
+0006  20 04       LOADI A, 0x04
+0008  60          ALLOC             ; 0x0C18
+0009  28 00 0C    LOADH H, 0x0C00
+000C  20 10       LOADI A, 0x10
+000E  72          FREE              ; -> список
+000F  28 18 0C    LOADH H, 0x0C18
+0012  20 04       LOADI A, 0x04
+0014  72          FREE              ; верхній
+0015  28 10 0C    LOADH H, 0x0C10
+0018  20 08       LOADI A, 0x08
+001A  72          FREE              ; верхній, за ним 0x0C00
+001B  00          HALT
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x10
+ember> set 2 0x60
+ember> set 3 0x20
+ember> set 4 0x08
+ember> set 5 0x60
+ember> set 6 0x20
+ember> set 7 0x04
+ember> set 8 0x60
+ember> set 9 0x28
+ember> set 10 0x00
+ember> set 11 0x0C
+ember> set 12 0x20
+ember> set 13 0x10
+ember> set 14 0x72
+ember> set 15 0x28
+ember> set 16 0x18
+ember> set 17 0x0C
+ember> set 18 0x20
+ember> set 19 0x04
+ember> set 20 0x72
+ember> set 21 0x28
+ember> set 22 0x10
+ember> set 23 0x0C
+ember> set 24 0x20
+ember> set 25 0x08
+ember> set 26 0x72
+ember> set 27 0x00
+ember> trace on
+ember> run
+0000  20 10     LOADI A, 0x10     -> A= 16  B=  0  H=0x0000  Z=0 N=0 C=0
+0002  60        ALLOC             -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+0003  20 08     LOADI A, 0x08     -> A=  8  B=  0  H=0x0c00  Z=0 N=0 C=0
+0005  60        ALLOC             -> A=  8  B=  0  H=0x0c10  Z=0 N=0 C=0
+0006  20 04     LOADI A, 0x04     -> A=  4  B=  0  H=0x0c10  Z=0 N=0 C=0
+0008  60        ALLOC             -> A=  4  B=  0  H=0x0c18  Z=0 N=0 C=0
+0009  28 00 0c  LOADH H, 0x0c00   -> A=  4  B=  0  H=0x0c00  Z=0 N=0 C=0
+000c  20 10     LOADI A, 0x10     -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+000e  72        FREE              -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+000f  28 18 0c  LOADH H, 0x0c18   -> A= 16  B=  0  H=0x0c18  Z=0 N=0 C=0
+0012  20 04     LOADI A, 0x04     -> A=  4  B=  0  H=0x0c18  Z=0 N=0 C=0
+0014  72        FREE              -> A=  4  B=  0  H=0x0c18  Z=0 N=0 C=0
+0015  28 10 0c  LOADH H, 0x0c10   -> A=  4  B=  0  H=0x0c10  Z=0 N=0 C=0
+0018  20 08     LOADI A, 0x08     -> A=  8  B=  0  H=0x0c10  Z=0 N=0 C=0
+001a  72        FREE              -> A=  8  B=  0  H=0x0c10  Z=0 N=0 C=0
+001b  00        HALT              -> A=  8  B=  0  H=0x0c10  Z=0 N=0 C=0
+halted after 16 steps
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c00, 0 used, 768 left
+free list: empty
+ember> quit
+```
+
+Хвіст більшого вільного блока, потім запис у звільнений блок через старий `H` — гостьове читання/запис після звільнення:
+
+```txt
+адр.  байти       текст
+0000  20 10       LOADI A, 0x10
+0002  60          ALLOC             ; 0x0C00
+0003  20 04       LOADI A, 0x04
+0005  60          ALLOC             ; 0x0C10
+0006  28 00 0C    LOADH H, 0x0C00
+0009  20 10       LOADI A, 0x10
+000B  72          FREE              ; -> список
+000C  20 05       LOADI A, 0x05
+000E  60          ALLOC             ; хвіст 0x0C00
+000F  28 00 0C    LOADH H, 0x0C00
+0012  20 FF       LOADI A, 0xFF
+0014  2A          STORE [H], A      ; у звільнений блок
+0015  20 01       LOADI A, 0x01
+0017  60          ALLOC
+0018  00          HALT
+```
+
+```txt
+ember> set 0 0x20
+ember> set 1 0x10
+ember> set 2 0x60
+ember> set 3 0x20
+ember> set 4 0x04
+ember> set 5 0x60
+ember> set 6 0x28
+ember> set 7 0x00
+ember> set 8 0x0C
+ember> set 9 0x20
+ember> set 10 0x10
+ember> set 11 0x72
+ember> set 12 0x20
+ember> set 13 0x05
+ember> set 14 0x60
+ember> set 15 0x28
+ember> set 16 0x00
+ember> set 17 0x0C
+ember> set 18 0x20
+ember> set 19 0xFF
+ember> set 20 0x2A
+ember> set 21 0x20
+ember> set 22 0x01
+ember> set 23 0x60
+ember> set 24 0x00
+ember> trace on
+ember> run
+0000  20 10     LOADI A, 0x10     -> A= 16  B=  0  H=0x0000  Z=0 N=0 C=0
+0002  60        ALLOC             -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+0003  20 04     LOADI A, 0x04     -> A=  4  B=  0  H=0x0c00  Z=0 N=0 C=0
+0005  60        ALLOC             -> A=  4  B=  0  H=0x0c10  Z=0 N=0 C=0
+0006  28 00 0c  LOADH H, 0x0c00   -> A=  4  B=  0  H=0x0c00  Z=0 N=0 C=0
+0009  20 10     LOADI A, 0x10     -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+000b  72        FREE              -> A= 16  B=  0  H=0x0c00  Z=0 N=0 C=0
+000c  20 05     LOADI A, 0x05     -> A=  5  B=  0  H=0x0c00  Z=0 N=0 C=0
+000e  60        ALLOC             -> A=  5  B=  0  H=0x0c0b  Z=0 N=0 C=0
+000f  28 00 0c  LOADH H, 0x0c00   -> A=  5  B=  0  H=0x0c00  Z=0 N=0 C=0
+0012  20 ff     LOADI A, 0xff     -> A=255  B=  0  H=0x0c00  Z=0 N=0 C=0
+0014  2a        STORE [H], A      -> A=255  B=  0  H=0x0c00  Z=0 N=0 C=0
+0015  20 01     LOADI A, 0x01     -> A=  1  B=  0  H=0x0c00  Z=0 N=0 C=0
+free list is broken at 0x00ff (ALLOC at 0x0017); nothing done
+stopped after 13 steps
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c14, 20 used, 748 left
+free list: 0x0c00 (11 bytes) -> broken at 0x00ff
+ember> dump 0xC00 16
+0c00  ff 00 0b 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+ember> quit
+```
+
+Розщеплення: блок 16 байтів на `0xC00` віддав хвіст `0x0C0B..0x0C0F` (5 байтів), вузол лишився з розміром 11 (`0b`). Запис `0xFF` у байт `0x0C00` зробив посилання на наступний вузол `0x00FF` — `ALLOC` відмовився, нічого не змінивши, `run` зупинився.
+
+Те саме з REPL — `alloc`/`free`/`heap` з помилками:
+
+```txt
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c00, 0 used, 768 left
+free list: empty
+ember> alloc 16
+allocated 16 bytes at 0x0c00 (bump), heap_ptr=0x0c10
+ember> alloc 8
+allocated 8 bytes at 0x0c10 (bump), heap_ptr=0x0c18
+ember> free 0xC00 16
+freed 16 bytes at 0x0c00 (free list)
+ember> free 0xC00 16
+not freed: already free; nothing done
+ember> free 0xC04 4
+not freed: already free; nothing done
+ember> free 0xC10 2
+not freed: too small for a list node (3 bytes); nothing done
+ember> free 0xB00 4
+not freed: not a used heap block; nothing done
+ember> free 0xC00 0
+not freed: not a used heap block; nothing done
+ember> alloc 5
+allocated 5 bytes at 0x0c0b (reused a free block), heap_ptr=0x0c18
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c18, 24 used, 744 left
+free list: 0x0c00 (11 bytes) -> end
+ember> free 0xC10 8
+freed 8 bytes at 0x0c10 (top: heap_ptr=0x0c10)
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0c10, 16 used, 752 left
+free list: 0x0c00 (11 bytes) -> end
+ember> alloc 0
+allocated 0 bytes at 0x0c10 (bump), heap_ptr=0x0c10
+ember> alloc 255
+allocated 255 bytes at 0x0c10 (bump), heap_ptr=0x0d0f
+ember> alloc 255
+allocated 255 bytes at 0x0d0f (bump), heap_ptr=0x0e0e
+ember> alloc 255
+255 bytes do not fit: heap_ptr=0x0e0e, 242 left; nothing done
+ember> heap
+heap 0x0c00-0x0eff: heap_ptr=0x0e0e, 526 used, 242 left
+free list: 0x0c00 (11 bytes) -> end
+ember> regs
+PC=0x0000  A=0  B=0  H=0x0000  Z=0 N=0 C=0
+ember> quit
+```
+
+`regs` наприкінці — нулі: хост працює як відладчик, регістри гостя не чіпає.
+
+### Тегований `struct Value`: об'єднання проти тегованої структури
+
+Даний рядок лаби `struct Value { enum class Kind { Byte, Addr, SpriteId }; uint16_t bits; };` оголошує тип `Kind`, але не поле цього типу: тега в байтах немає. Я лишив імена лаби й додав поле `kind`:
+
+```cpp
+// lab: struct Value { enum class Kind { Byte, Addr, SpriteId }; uint16_t bits; };
+// That line declares the type Kind but no member of it: sizeof == 2 and no
+// tag in the bytes. `kind` is the tag; ": std::uint8_t" keeps it one byte
+// (an int would make sizeof 8).
+struct Value {
+    enum class Kind : std::uint8_t { Byte, Addr, SpriteId };
+    Kind kind;          // the tag: which of the three `bits` means
+    std::uint16_t bits; // a byte (0..255), a guest address or a sprite index
+};
+```
+
+Три варіанти, `sizeof` на цій машині (GCC 16): як у лабі (без поля) — 2; з полем `Kind kind`, де `Kind` без типу-основи (`int`) — 8; наш (`enum class Kind : std::uint8_t`) — 4, з одним вирівнювальним байтом перед `bits`:
+
+```cpp
+#include <cstdint>
+#include <iostream>
+struct ValueLab { enum class Kind { Byte, Addr, SpriteId }; uint16_t bits; };
+struct ValueInt { enum class Kind { Byte, Addr, SpriteId }; Kind kind; std::uint16_t bits; };
+struct ValueOurs { enum class Kind : std::uint8_t { Byte, Addr, SpriteId }; Kind kind; std::uint16_t bits; };
+int main() {
+    std::cout << sizeof(ValueLab) << ' ' << sizeof(ValueInt) << ' ' << sizeof(ValueOurs) << '\n';
+}
+```
+
+```txt
+2 8 4
+```
+
+`make_value` перевіряє діапазон виду (байт 0..255, адреса 0..4095, спрайт 0..7), `print_value` — один `switch` за тегом. Ним друкують `value`, `sprite` і `sprites`:
+
+```txt
+ember> layout value
+Value: sizeof=4 alignof=2
+  off size field
+    0    1 kind (Kind)
+    1    1 (padding)
+    2    2 bits
+  fields 3 + padding 1 = 4
+ember> value byte 65
+byte 65: 65  0x41  0b01000001  'A'
+ember> value addr 0xC00
+addr 0x0c00: heap, byte 0x00
+ember> value addr 0xB00
+addr 0x0b00: port_out, byte 0x00
+ember> value addr 0xB02
+addr 0x0b02: status, byte 0x00
+ember> sprite 1 62 1 1 -1
+sprite 1: x=62 y=1 vx=1 vy=-1 alive
+ember> value sprite 1
+sprite 1: x=62 y=1 vx=1 vy=-1 alive
+ember> value byte 300
+a byte is 0..255, got 300
+ember> value addr 5000
+address 5000 is outside 0..4095
+ember> value sprite 8
+sprite index is 0..7, got 8
+ember> value word 1
+usage: value <byte|addr|sprite> <n>
+ember> quit
+```
+
+**Об'єднання** (`union`) кладе всі варіанти в ті самі байти, а який із них там зараз, пам'ятає **програміст**: у байтах цього немає. У C++ читати не той член, що записали останнім, — невизначена поведінка, і UBSan її не ловить; GCC документує, що читання дає байти, тому на little-endian машині видно молодший байт адреси, а законний спосіб подивитись на байти — `std::memcpy`:
+
+```cpp
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+union Raw {                 // the same 2 bytes, two names
+    std::uint16_t addr;
+    std::uint8_t byte;
+};
+int main() {
+    Raw r;
+    r.addr = 0x0C41;        // the active member is now addr
+    std::cout << sizeof(Raw) << ' ' << std::hex << int(r.byte) << '\n'; // UB in C++: byte is not active
+    std::uint8_t b;
+    std::memcpy(&b, &r.addr, 1); // the defined way to look at the bytes
+    std::cout << int(b) << '\n';
+}
+```
+
+```txt
+2 41
+41
+```
+
+**Тегована структура** тримає вид у самих байтах (`kind`): `print_value` не вгадує, а читає тег, і `value addr 0xC00` та `value byte 65` не сплутати. Ціна — байт тега плюс вирівнювання (4 замість 2).
+
+### `std::unique_ptr<Sprite>`: `delete` живе в деструкторі
+
+Хостовий `Sprite` у купі, сирим `new` без `delete` — витік рівно `sizeof(Sprite)` = 5 байтів:
+
+```cpp
+#include <cstdint>
+#include <iostream>
+struct Sprite {
+    std::uint8_t x, y;
+    std::int8_t  vx, vy;
+    bool alive;
+};
+int main() {
+    Sprite* p = new Sprite{10, 5, 1, 0, true};
+    std::cout << int(p->x) << ' ' << sizeof(Sprite) << '\n';
+}
+```
+
+```txt
+10 5
+
+=================================================================
+==925654==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 5 byte(s) in 1 object(s) allocated from:
+    #0 0x7fd8db92d2a1 in operator new(unsigned long) (/usr/lib/libasan.so.8+0x12d2a1) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x5624784ac22b in main /tmp/claude-1000/-home-user-Projects-ember/e8eee81f-3d32-4df4-a5c8-a6f79bd51e2b/scratchpad/l6/x/raw/scratch.cpp:9
+    … (кадри libc і _start обрізано)
+
+SUMMARY: AddressSanitizer: 5 byte(s) leaked in 1 allocation(s).
+```
+
+Те саме через `std::make_unique` — `delete` викликає деструктор `unique_ptr`, коли `p` виходить з області видимості:
+
+```cpp
+#include <cstdint>
+#include <iostream>
+#include <memory>
+struct Sprite {
+    std::uint8_t x, y;
+    std::int8_t  vx, vy;
+    bool alive;
+};
+int main() {
+    auto p = std::make_unique<Sprite>(Sprite{10, 5, 1, 0, true});
+    std::cout << int(p->x) << ' ' << sizeof(Sprite) << '\n';
+}   // here the unique_ptr dies, and its destructor calls delete
+```
+
+```txt
+10 5
+```
+
+Звіту немає, код виходу 0. Обидва — тим самим рядком збірки, що в M3; у `src/` `unique_ptr` не з'являється (лаба просить подивитись, а не переписувати).
+
+## Реалізовані рядки [ISA.uk.md](https://github.com/rmalkevy/Programming-Practice-Projects/blob/main/courses/programming-fundamentals/ISA.uk.md) (Лаба 6)
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x60` | `ALLOC` | 1 | C | виділити в купі `A` байтів: `H` стає адресою блока, вказівник купи посувається. Не влізло — виставити `C`, `H` не чіпати | 6 |
+
+| Регіон | Діапазон | Константа | З'являється в |
+|---|---|---|---|
+| Купа | `0xC00`–`0xEFF` | `HEAP_LO`, `HEAP_HI` | Lab 6 |
+
+## Власні розширення
+
+| Опкод | Мнемоніка | Розмір | Прапорці | Що робить | Лаба |
+|---|---|---|---|---|---|
+| `0x72` | `FREE` | 1 | C | повернути в купу блок `[H, H + A)` (`A` — той самий розмір, що просили в `ALLOC`): верхній блок опускає вказівник купи, інший стає вузлом списку вільних блоків. Не блок купи, `A = 0`, уже вільний або менший за 3 байти не на вершині — виставити `C`, нічого не міняти | 6 |
+
+Номер — з вільного діапазону `0x70`–`0xFF` (ISA §8); `0x61`–`0x6F` і `0x73` і далі лишаються невідомими опкодами. Уточнення рядка `ALLOC`: успіх — `C = 0`; `A = 0` — `H = heap_ptr`, нічого не посувається; при непорожньому списку вільних блоків `ALLOC` спершу бере звідти (first fit: блок рівно на `A` байтів або хвіст блока, більшого щонайменше на 3), і тоді `heap_ptr` не посувається; зіпсований список — помилка кроку, нічого не змінено. `JG`/`JL` (`0x70`/`0x71`) — як у Lab 04; байт стану — `0xB02`, як у Lab 05.

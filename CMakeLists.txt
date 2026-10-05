@@ -17,6 +17,10 @@ add_executable(ember
     src/search.cpp
     src/display.cpp
     src/sort.cpp
+    src/heap.cpp
+    src/sprite.cpp
+    src/value.cpp
+    src/layout.cpp
 )
 
 target_compile_options(ember PRIVATE -Wall -Wextra -Werror)

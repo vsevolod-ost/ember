@@ -49,7 +49,10 @@ enum class Op : std::uint8_t {
     Plot = 0x41,
     Unplot = 0x42,
     Show = 0x43,
-    // 0x7_ — own extensions (ISA §8: 0x70-0xFF are free), Lab 4
-    Jg = 0x70, // jump if A > B as signed bytes (-128..127); flags untouched
-    Jl = 0x71, // jump if A < B as signed bytes (-128..127); flags untouched
+    // 0x6_ — system (Lab 6)
+    Alloc = 0x60, // H = a new block of A bytes on the guest heap; C = 1: it does not fit
+    // 0x7_ — own extensions (ISA §8: 0x70-0xFF are free), Lab 4 and Lab 6
+    Jg = 0x70,   // jump if A > B as signed bytes (-128..127); flags untouched
+    Jl = 0x71,   // jump if A < B as signed bytes (-128..127); flags untouched
+    Free = 0x72, // own (Lab 6): give [H, H + A) back to the heap; C = 1: refused
 };

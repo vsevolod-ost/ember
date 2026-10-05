@@ -17,11 +17,15 @@
 #include "display.hpp"
 #include "dump.hpp"
 #include "guest_io.hpp"
+#include "heap.hpp"
 #include "hexdump.hpp"
+#include "layout.hpp"
 #include "memory.hpp"
 #include "run.hpp"
 #include "search.hpp"
 #include "sort.hpp"
+#include "sprite.hpp"
+#include "value.hpp"
 
 // Turn a word into a number. Accepts decimal (65) and hex (0x41).
 // Returns false if the word is not a number at all.
@@ -99,7 +103,59 @@ static void report(StepResult r, const CPU& cpu) {
                   << " (" << disasm(*cpu.mem, cpu.pc) << " at " << hex(cpu.pc, 4)
                   << "); nothing done\n";
         break;
+    case StepResult::bad_heap: {
+        // Nothing changed, so the same walk finds the same bad node.
+        std::uint16_t bad = 0;
+        heap_check(cpu, bad);
+        std::cout << "free list is broken at " << hex(bad, 4) << " (" << disasm(*cpu.mem, cpu.pc)
+                  << " at " << hex(cpu.pc, 4) << "); nothing done\n";
+        break;
     }
+    }
+}
+
+// Why heap_alloc/heap_free said no, for `alloc` and `free`: "not freed: ...".
+static void print_heap_refusal(const char* what, HeapResult r, const CPU& cpu) {
+    std::uint16_t bad = 0;
+    switch (r) {
+    case HeapResult::ok:
+    case HeapResult::no_room:
+        break;
+    case HeapResult::bad_block:
+        std::cout << what << ": not a used heap block; nothing done\n";
+        break;
+    case HeapResult::already_free:
+        std::cout << what << ": already free; nothing done\n";
+        break;
+    case HeapResult::too_small:
+        std::cout << what << ": too small for a list node (" << NODE_SIZE
+                  << " bytes); nothing done\n";
+        break;
+    case HeapResult::broken_list:
+        heap_check(cpu, bad);
+        std::cout << what << ": free list is broken at " << hex(bad, 4) << "; nothing done\n";
+        break;
+    }
+}
+
+// The kind named by a word of `value`; false for any other word.
+static bool kind_by_name(const std::string& name, Value::Kind& kind) {
+    if (name == "byte")
+        kind = Value::Kind::Byte;
+    else if (name == "addr")
+        kind = Value::Kind::Addr;
+    else if (name == "sprite")
+        kind = Value::Kind::SpriteId;
+    else
+        return false;
+    return true;
+}
+
+// One sprite's record, printed through a tagged Value like `value sprite i`.
+static void print_sprite(int i, const Memory& mem, const Sprite sprites[]) {
+    Value v{};
+    if (make_value(Value::Kind::SpriteId, i, v))
+        print_value(v, mem, sprites);
 }
 
 static void print_help() {
@@ -135,7 +191,22 @@ static void print_help() {
               << "                    show: draw them as columns after every pass\n"
               << "  anim <steps> <frames>\n"
               << "                    run at most steps steps, then show; frames times\n"
-              << "  hostdump cpu      the host's CPU struct as raw bytes\n"
+              << "  hostdump <cpu|sprites>\n"
+              << "                    the host's CPU struct or sprites array as raw bytes\n"
+              << "  layout [cpu|flags|instruction|sprite|value]\n"
+              << "                    offset and size of each field, padding, sizeof\n"
+              << "  sprite <i> <x> <y> <vx> <vy>\n"
+              << "                    set host sprite i (0..7) alive: x 0..63, y 0..31,\n"
+              << "                    vx -63..63, vy -31..31; redraw VRAM\n"
+              << "  sprite <i> off    kill sprite i; redraw VRAM\n"
+              << "  sprites           list all " << SPRITE_COUNT << " sprites\n"
+              << "  tick [n]          n times (1..100, 1): move alive sprites, bounce, show\n"
+              << "  heap              guest heap " << hex(HEAP_LO, 4) << '-' << hex(HEAP_HI, 4)
+              << ": heap_ptr and the free list\n"
+              << "  alloc <n>         ALLOC n bytes (0..255) as the host; registers untouched\n"
+              << "  free <addr> <n>   FREE n bytes at addr as the host; registers untouched\n"
+              << "  value <byte|addr|sprite> <n>\n"
+              << "                    make a tagged Value and print it by its tag\n"
               << "  help              this list\n"
               << "  quit              leave\n";
 }
@@ -143,6 +214,8 @@ static void print_help() {
 int main() {
     Memory mem; // 4096 bytes, on the stack, zeroed by the {} in memory.hpp
     CPU cpu{&mem};
+    // Lab 6: eight host records; the {} makes every field 0, so all are dead.
+    Sprite sprites[SPRITE_COUNT]{};
     bool trace = false;   // `trace on`: run prints a line per step, like step
     long breakpoint = -1; // `b <addr>`: run stops when PC gets there; -1 = none
 
@@ -515,11 +588,17 @@ int main() {
                     show(mem);
                 }
             }
+        } else if (cmd == "hostdump" && second_word(line) == "sprites") {
+            // Eight 5-byte records one after another: an array has no gaps.
+            std::cout << "&sprites=" << static_cast<const void*>(sprites)
+                      << "  sizeof(sprites)=" << sizeof(sprites)
+                      << "  sizeof(Sprite)=" << sizeof(Sprite) << '\n';
+            dump(sprites, sizeof(sprites));
         } else if (cmd == "hostdump") {
             std::string what;
             words >> what;
             if (what != "cpu") {
-                std::cout << "usage: hostdump cpu\n";
+                std::cout << "usage: hostdump <cpu|sprites>\n";
             } else {
                 // Host facts: where the struct lives in THIS process, and how big.
                 std::cout << "&cpu=" << static_cast<const void*>(&cpu)
@@ -527,6 +606,126 @@ int main() {
                           << "  sizeof(cpu.mem)=" << sizeof(cpu.mem)
                           << "  sizeof(*cpu.mem)=" << sizeof(*cpu.mem) << '\n';
                 dump(&cpu, sizeof(cpu));
+            }
+        } else if (cmd == "layout") {
+            std::string what, extra;
+            words >> what;
+            if (words >> extra || !print_layout(what))
+                std::cout << "usage: layout [cpu|flags|instruction|sprite|value]\n";
+        } else if (cmd == "sprite") {
+            // `sprite <i> <x> <y> <vx> <vy>` or `sprite <i> off`. Every range
+            // is checked before the record changes.
+            std::string w[5], extra;
+            long n[5] = {0, 0, 0, 0, 0};
+            int got = 0;
+            while (got < 5 && words >> w[got])
+                ++got;
+            const bool off = got == 2 && w[1] == "off";
+            bool numbers = got == 5 || off;
+            for (int k = 0; numbers && k < (off ? 1 : 5); ++k)
+                numbers = parse_number(w[k], n[k]);
+            if (!numbers || words >> extra) {
+                std::cout << "usage: sprite <i> <x> <y> <vx> <vy> | sprite <i> off\n";
+            } else if (n[0] < 0 || n[0] >= SPRITE_COUNT) {
+                print_value_error(Value::Kind::SpriteId, n[0]);
+            } else if (!off && (n[1] < 0 || n[1] >= SCREEN_W)) {
+                std::cout << "x is 0.." << SCREEN_W - 1 << ", got " << n[1] << '\n';
+            } else if (!off && (n[2] < 0 || n[2] >= SCREEN_H)) {
+                std::cout << "y is 0.." << SCREEN_H - 1 << ", got " << n[2] << '\n';
+            } else if (!off && (n[3] < -(SCREEN_W - 1) || n[3] > SCREEN_W - 1)) {
+                std::cout << "vx is " << -(SCREEN_W - 1) << ".." << SCREEN_W - 1 << ", got " << n[3]
+                          << '\n';
+            } else if (!off && (n[4] < -(SCREEN_H - 1) || n[4] > SCREEN_H - 1)) {
+                std::cout << "vy is " << -(SCREEN_H - 1) << ".." << SCREEN_H - 1 << ", got " << n[4]
+                          << '\n';
+            } else {
+                Sprite& s = sprites[n[0]];
+                if (off) {
+                    s.alive = false;
+                } else {
+                    // All in range: the casts cut nothing.
+                    s.x = static_cast<std::uint8_t>(n[1]);
+                    s.y = static_cast<std::uint8_t>(n[2]);
+                    s.vx = static_cast<std::int8_t>(n[3]);
+                    s.vy = static_cast<std::int8_t>(n[4]);
+                    s.alive = true;
+                }
+                sprites_draw(mem, sprites);
+                print_sprite(static_cast<int>(n[0]), mem, sprites);
+            }
+        } else if (cmd == "sprites") {
+            for (int i = 0; i < SPRITE_COUNT; ++i)
+                print_sprite(i, mem, sprites);
+        } else if (cmd == "tick") {
+            std::string t, extra;
+            long times = 1;
+            if ((words >> t && !parse_number(t, times)) || words >> extra || times < 1 ||
+                times > 100) {
+                std::cout << "usage: tick [1..100]\n";
+            } else {
+                // The screen is a picture of the array: move, then redraw it all.
+                for (long k = 1; k <= times; ++k) {
+                    sprites_tick(sprites);
+                    sprites_draw(mem, sprites);
+                    std::cout << "tick " << k << ": " << sprites_alive(sprites) << " alive\n";
+                    show(mem);
+                }
+            }
+        } else if (cmd == "heap") {
+            heap_print(cpu);
+        } else if (cmd == "alloc") {
+            // The same heap_alloc as ALLOC, but the host is a debugger: H and
+            // C stay as they are; only the heap changes.
+            std::string ns, extra;
+            long n = 0;
+            if (!(words >> ns) || words >> extra || !parse_number(ns, n) || n < 0 || n > 255) {
+                std::cout << "usage: alloc <0..255>\n";
+            } else {
+                std::uint16_t at = 0;
+                bool reused = false;
+                const HeapResult r = heap_alloc(cpu, static_cast<Byte>(n), at, reused);
+                if (r == HeapResult::ok)
+                    std::cout << "allocated " << n << " bytes at " << hex(at, 4)
+                              << (reused ? " (reused a free block)" : " (bump)")
+                              << ", heap_ptr=" << hex(cpu.heap_ptr, 4) << '\n';
+                else if (r == HeapResult::no_room)
+                    std::cout << n << " bytes do not fit: heap_ptr=" << hex(cpu.heap_ptr, 4) << ", "
+                              << HEAP_HI + 1 - cpu.heap_ptr << " left; nothing done\n";
+                else
+                    print_heap_refusal("not allocated", r, cpu);
+            }
+        } else if (cmd == "free") {
+            std::string as, ns, extra;
+            long addr = 0, n = 0;
+            if (!(words >> as >> ns) || words >> extra || !parse_number(as, addr) ||
+                !parse_number(ns, n) || addr < 0 || addr > 0xFFFF || n < 0 || n > 255) {
+                std::cout << "usage: free <addr> <0..255>\n";
+            } else {
+                bool top = false;
+                const HeapResult r =
+                    heap_free(cpu, static_cast<std::uint16_t>(addr), static_cast<Byte>(n), top);
+                if (r == HeapResult::ok && top)
+                    std::cout << "freed " << n << " bytes at "
+                              << hex(static_cast<unsigned>(addr), 4)
+                              << " (top: heap_ptr=" << hex(cpu.heap_ptr, 4) << ")\n";
+                else if (r == HeapResult::ok)
+                    std::cout << "freed " << n << " bytes at "
+                              << hex(static_cast<unsigned>(addr), 4) << " (free list)\n";
+                else
+                    print_heap_refusal("not freed", r, cpu);
+            }
+        } else if (cmd == "value") {
+            std::string k, ns, extra;
+            long n = 0;
+            Value::Kind kind = Value::Kind::Byte;
+            Value v{};
+            if (!(words >> k >> ns) || words >> extra || !kind_by_name(k, kind) ||
+                !parse_number(ns, n)) {
+                std::cout << "usage: value <byte|addr|sprite> <n>\n";
+            } else if (!make_value(kind, n, v)) {
+                print_value_error(kind, n);
+            } else {
+                print_value(v, mem, sprites);
             }
         } else {
             std::cout << "unknown command: " << cmd << " (try `help`)\n";

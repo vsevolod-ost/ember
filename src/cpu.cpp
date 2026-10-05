@@ -7,6 +7,7 @@
 
 #include "display.hpp"
 #include "guest_io.hpp"
+#include "heap.hpp"
 #include "opcodes.hpp"
 
 Decoded decode(Byte op) {
@@ -42,6 +43,8 @@ std::uint16_t instr_size(Byte op) {
     case Op::IncH:
     case Op::DecH:
     case Op::HLow:
+    case Op::Alloc:
+    case Op::Free:
         return 1;
     case Op::LoadiA:
     case Op::LoadiB:
@@ -93,6 +96,8 @@ static std::string mnemonic(Op op, Byte imm8, std::uint16_t w16) {
         return "UNPLOT";
     case Op::Show:
         return "SHOW";
+    case Op::Alloc:
+        return "ALLOC";
     case Op::Add:
         return "ADD A, B";
     case Op::Sub:
@@ -157,32 +162,61 @@ static std::string mnemonic(Op op, Byte imm8, std::uint16_t w16) {
         return "JG " + hex(w16, 4);
     case Op::Jl:
         return "JL " + hex(w16, 4);
+    case Op::Free:
+        return "FREE";
     }
     return "?";
 }
 
-std::string disasm(const Memory& mem, std::uint16_t at) {
+// Read the whole instruction at `at` (PC, for step) before executing it: a
+// STORE may overwrite its own bytes. The byte becomes an Op here, once, after
+// instr_size has said it is a row of the ISA. 16-bit operands go through the
+// given get16.
+static StepResult fetch(const Memory& mem, std::size_t at, Instruction& ins) {
+    if (at >= MEM_SIZE)
+        return StepResult::out_of_memory;
     const Byte op = mem_get(mem, at);
-    if (instr_size(op) == 0)
+    const std::uint16_t size = instr_size(op);
+    if (size == 0)
+        return StepResult::bad_opcode;
+    // The one bounds check on the instruction stream: never read an operand
+    // past the last byte of the box.
+    if (at + size > MEM_SIZE)
+        return StepResult::out_of_memory;
+
+    ins.at = static_cast<std::uint16_t>(at);
+    ins.op = static_cast<Op>(op);
+    ins.size = static_cast<Byte>(size);
+    ins.bytes[0] = op;
+    ins.bytes[1] = size > 1 ? mem_get(mem, at + 1) : Byte{0};
+    ins.bytes[2] = size > 2 ? mem_get(mem, at + 2) : Byte{0};
+    ins.w16 = size == 3 ? get16(mem, at + 1) : 0;
+    return StepResult::ok;
+}
+
+std::string disasm(const Memory& mem, std::uint16_t at) {
+    Instruction ins{};
+    if (fetch(mem, at, ins) != StepResult::ok)
         return "?";
-    return mnemonic(static_cast<Op>(op), mem_get(mem, at + 1), get16(mem, at + 1));
+    return mnemonic(ins.op, ins.bytes[1], ins.w16);
 }
 
 std::uint16_t data_address(const CPU& cpu) {
-    const Op op = static_cast<Op>(mem_get(*cpu.mem, cpu.pc));
-    if (op == Op::LoadAH || op == Op::StoreHA)
+    Instruction ins{};
+    fetch(*cpu.mem, cpu.pc, ins);
+    if (ins.op == Op::LoadAH || ins.op == Op::StoreHA)
         return cpu.h;
-    return get16(*cpu.mem, cpu.pc + 1u);
+    return ins.w16;
 }
 
 // Every access the GUEST makes to a byte it names by address goes through
-// these two (LOAD/STORE by addr16 and by H, OUTS). A guest address outside
-// the box is refused, never wrapped. The output port and the timer live here,
-// in one place, so they work for every way a guest reaches them; the host
-// (set, get, plot, sort) uses mem_get/mem_set and sees plain memory there.
-// CLS/PLOT/UNPLOT write VRAM through the same plot/clear as the REPL: VRAM
-// never overlaps the port.
-static bool guest_read(const CPU& cpu, std::size_t addr, Byte& out) {
+// these two (LOAD/STORE by addr16 and by H, OUTS, the heap's free list). A
+// guest address outside the box is refused, never wrapped. The output port
+// and the timer live here, in one place, so they work for every way a guest
+// reaches them; the host (set, get, plot, sort) uses mem_get/mem_set and sees
+// plain memory there. CLS/PLOT/UNPLOT write VRAM through the same plot/clear
+// as the REPL: VRAM never overlaps the port.
+bool guest_read(const CPU& cpu, std::size_t addr, Byte& out) {
     if (addr >= MEM_SIZE)
         return false;
     if (addr == TICKS)
@@ -193,7 +227,7 @@ static bool guest_read(const CPU& cpu, std::size_t addr, Byte& out) {
     return true;
 }
 
-static bool guest_write(CPU& cpu, std::size_t addr, Byte value) {
+bool guest_write(CPU& cpu, std::size_t addr, Byte value) {
     if (!mem_set(*cpu.mem, addr, value))
         return false; // nothing written: addr >= MEM_SIZE
     if (addr == PORT_OUT)
@@ -220,13 +254,12 @@ static void print_flags(const Flags& f) {
 }
 
 // AAAA  OP B1 B2  MNEMONIC          -> A=nnn  B=nnn  H=0xhhhh  Z=z N=n C=c
-static void print_trace(const CPU& cpu, std::uint16_t at, const Byte* bytes, std::uint16_t size,
-                        const std::string& text) {
+static void print_trace(const CPU& cpu, const Instruction& ins, const std::string& text) {
     guest_end_line(); // OUT may have left the line open
-    std::cout << std::hex << std::setfill('0') << std::setw(4) << at << ' ';
+    std::cout << std::hex << std::setfill('0') << std::setw(4) << ins.at << ' ';
     for (std::uint16_t i = 0; i < 3; ++i) {
-        if (i < size)
-            std::cout << ' ' << std::setw(2) << static_cast<int>(bytes[i]);
+        if (i < ins.size)
+            std::cout << ' ' << std::setw(2) << static_cast<int>(ins.bytes[i]);
         else
             std::cout << "   ";
     }
@@ -242,37 +275,28 @@ static void print_trace(const CPU& cpu, std::uint16_t at, const Byte* bytes, std
 StepResult step(CPU& cpu, bool trace) {
     if (cpu.halted)
         return StepResult::halted;
-    if (cpu.pc >= MEM_SIZE)
-        return StepResult::out_of_memory;
 
-    const std::uint16_t at = cpu.pc;
-    const Byte op = mem_get(*cpu.mem, at);
-    const std::uint16_t size = instr_size(op);
-    if (size == 0)
-        return StepResult::bad_opcode;
-    // The one bounds check on the instruction stream: never read an operand
-    // past the last byte of the box.
-    if (at + size > MEM_SIZE)
-        return StepResult::out_of_memory;
-
-    // Fetch the whole instruction before executing it (a STORE may overwrite
-    // its own bytes). 16-bit operands go through the given get16.
-    const Byte bytes[3] = {op, size > 1 ? mem_get(*cpu.mem, at + 1u) : Byte{0},
-                           size > 2 ? mem_get(*cpu.mem, at + 2u) : Byte{0}};
-    const std::uint16_t w16 = size == 3 ? get16(*cpu.mem, at + 1u) : 0;
-    const Byte imm8 = bytes[1];
-    const Decoded d = decode(op);
+    Instruction ins{};
+    const StepResult fetched = fetch(*cpu.mem, cpu.pc, ins);
+    if (fetched != StepResult::ok)
+        return fetched;
+    const std::uint16_t w16 = ins.w16;
+    const Byte imm8 = ins.bytes[1];
+    const Decoded d = decode(ins.bytes[0]);
     Byte v = 0;
+    std::uint16_t block = 0; // ALLOC: where the new block starts
+    bool flag = false;       // ALLOC: the block was reused; FREE: it was the top one
+    HeapResult hr = HeapResult::ok;
     // Where PC goes after this instruction: the next one, unless a jump is taken.
-    std::uint16_t next = static_cast<std::uint16_t>(at + size);
+    std::uint16_t next = static_cast<std::uint16_t>(ins.at + ins.size);
 
     // Every error path returns before anything is changed. Each known opcode
     // has its own case; every default is the second place an unknown opcode
-    // is caught (after instr_size). The 0x0_, 0x2_, 0x3_ and 0x7_ rows never
-    // touch the flags (ISA §3); the 0x4_ rows touch only C.
+    // is caught (after instr_size). The 0x0_, 0x2_, 0x3_ rows and JG/JL never
+    // touch the flags (ISA §3); the 0x4_, 0x6_ rows and FREE touch only C.
     switch (d.group) {
     case 0x0:
-        switch (static_cast<Op>(op)) {
+        switch (ins.op) {
         case Op::Halt:
             cpu.halted = true;
             break;
@@ -300,7 +324,7 @@ StepResult step(CPU& cpu, bool trace) {
         }
         break;
     case 0x1:
-        switch (static_cast<Op>(op)) {
+        switch (ins.op) {
         case Op::Add:
             cpu.a = alu_add(cpu.a, cpu.b, cpu.f);
             break;
@@ -339,7 +363,7 @@ StepResult step(CPU& cpu, bool trace) {
         }
         break;
     case 0x2:
-        switch (static_cast<Op>(op)) {
+        switch (ins.op) {
         case Op::LoadiA:
             cpu.a = imm8;
             break;
@@ -398,7 +422,7 @@ StepResult step(CPU& cpu, bool trace) {
         }
         break;
     case 0x3:
-        switch (static_cast<Op>(op)) {
+        switch (ins.op) {
         case Op::Jmp:
             if (!jump_to(w16, next))
                 return StepResult::bad_address;
@@ -426,7 +450,7 @@ StepResult step(CPU& cpu, bool trace) {
     case 0x4:
         // The screen. PLOT/UNPLOT touch only C: 1 = off the screen and
         // nothing changed, 0 = done. Z and N are never touched.
-        switch (static_cast<Op>(op)) {
+        switch (ins.op) {
         case Op::Cls:
             clear(*cpu.mem);
             break;
@@ -444,11 +468,27 @@ StepResult step(CPU& cpu, bool trace) {
             return StepResult::bad_opcode;
         }
         break;
+    case 0x6:
+        // The guest heap (heap.cpp). Not fitting is no error of the step:
+        // C = 1 and H stays. Z, N, A and B are never touched.
+        switch (ins.op) {
+        case Op::Alloc:
+            hr = heap_alloc(cpu, cpu.a, block, flag);
+            if (hr == HeapResult::broken_list)
+                return StepResult::bad_heap;
+            if (hr == HeapResult::ok)
+                cpu.h = block;
+            cpu.f.c = hr != HeapResult::ok;
+            break;
+        default:
+            return StepResult::bad_opcode;
+        }
+        break;
     case 0x7:
         // Own extensions: compare A and B themselves as signed numbers. The
         // flags cannot say this alone: N of A - B is wrong when the
         // subtraction overflows (A = -128, B = 1 gives 0x7F, N = 0).
-        switch (static_cast<Op>(op)) {
+        switch (ins.op) {
         case Op::Jg:
             if (as_signed(cpu.a) > as_signed(cpu.b) && !jump_to(w16, next))
                 return StepResult::bad_address;
@@ -456,6 +496,15 @@ StepResult step(CPU& cpu, bool trace) {
         case Op::Jl:
             if (as_signed(cpu.a) < as_signed(cpu.b) && !jump_to(w16, next))
                 return StepResult::bad_address;
+            break;
+        case Op::Free:
+            // Give [H, H + A) back; A is the size asked of ALLOC. A refused
+            // block (not in use, already free, ...) is C = 1, not an error.
+            // H and A keep their values: H now dangles, as after delete.
+            hr = heap_free(cpu, cpu.h, cpu.a, flag);
+            if (hr == HeapResult::broken_list)
+                return StepResult::bad_heap;
+            cpu.f.c = hr != HeapResult::ok;
             break;
         default:
             return StepResult::bad_opcode;
@@ -470,7 +519,7 @@ StepResult step(CPU& cpu, bool trace) {
     mem_set(*cpu.mem, STATUS_ADDR, static_cast<Byte>((cpu.f.z << 2) | (cpu.f.n << 1) | cpu.f.c));
 
     if (trace)
-        print_trace(cpu, at, bytes, size, mnemonic(static_cast<Op>(op), imm8, w16));
+        print_trace(cpu, ins, mnemonic(ins.op, imm8, w16));
     return StepResult::ok;
 }
 
